@@ -1231,6 +1231,13 @@ def validate_args(args, defaults={}):
         assert args.experimental_attention_variant is None, "Muon optimizer does not support attention variant for now."
         assert not args.attention_output_gate, "Muon optimizer does not support attention output gate for now."
 
+    # Roo optimizer check
+    if args.optimizer == 'roo':
+        assert not args.use_distributed_optimizer, "Roo optimizer does not support distributed optimizer for now."
+        assert not args.use_torch_fsdp2, "Roo optimizer does not support Torch-FSDP2 for now."
+        assert not args.use_megatron_fsdp, "Roo optimizer does not support Megatron-FSDP for now."
+        assert args.ckpt_format in ["torch", "torch_dist"], "Roo optimizer supports torch and torch_dist checkpoint format."
+
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (
@@ -2063,6 +2070,23 @@ def _add_regularization_args(parser):
                        help='How to perform NS calculation for tensor model parallel weights')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
+    group.add_argument('--roo-momentum', type=float, default=0.95,
+                       help='Momentum coefficient for Roo optimizer')
+    group.add_argument('--roo-epsilon', type=float, default=0.01,
+                       help='Regularization epsilon for Roo inverse-spectral transform')
+    group.add_argument('--roo-scale-factor', type=float, default=1.0,
+                       help='Scale factor applied after RMS normalization of the Roo update')
+    group.add_argument('--roo-no-split-qkv', action='store_false', default=True,
+                       dest='roo_split_qkv',
+                       help='Whether to split QKV parameters for Roo optimizer')
+    group.add_argument('--roo-tp-mode', type=str, default='allreduce_gram',
+                       choices=['allreduce_gram', 'blockwise'],
+                       help='TP handling mode for Roo gram matrix computation')
+    group.add_argument('--roo-num-ns-steps', type=int, default=5,
+                       help='Number of Newton-Schulz iteration steps for Roo gram matrix inversion')
+    group.add_argument('--roo-fp32-matmul-prec', type=str, default='medium',
+                       choices=['low', 'medium', 'high'],
+                       help='FP32 matmul precision for Newton-Schulz iteration in Roo')
 
     return parser
 
@@ -2314,7 +2338,7 @@ def _add_training_args(parser):
     group.add_argument('--qk-clip-threshold', type=float, default=100,
                        help='The balancing threshold for qk-clip.')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'roo'],
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
