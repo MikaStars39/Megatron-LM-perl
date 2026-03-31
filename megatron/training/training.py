@@ -83,6 +83,7 @@ from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import get_megatron_optimizer, AdamOptimizerConfig, SGDOptimizerConfig, OptimizerConfig, ParamKey
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
+from megatron.core.optimizer.roo import get_megatron_roo_optimizer
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -1182,7 +1183,7 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     """Return a Megatron optimizer config object from Megatron's arguments."""
 
     config = None
-    if args.optimizer == 'adam' or 'muon' in args.optimizer:
+    if args.optimizer == 'adam' or 'muon' in args.optimizer or args.optimizer == 'roo':
         # TODO(deyuf): Muon needs both adam + muon but get() only receive one config
         # So for now we keep using adam config that's back compat with old way
         kwargs = {}
@@ -1231,7 +1232,7 @@ def setup_model_and_optimizer(
     config, config_overrides = get_megatron_optimizer_config(args)
     config.timers = timers
 
-    if 'muon' not in config.optimizer:
+    if 'muon' not in config.optimizer and config.optimizer != 'roo':
         # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
         # to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
         # default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
@@ -1241,6 +1242,13 @@ def setup_model_and_optimizer(
             config_overrides=config_overrides,
             use_gloo_process_groups=args.enable_gloo_process_groups,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
+        )
+    elif config.optimizer == 'roo':
+        optimizer = get_megatron_roo_optimizer(
+            config,
+            model,
+            config_overrides=config_overrides,
+            use_gloo_process_groups=args.enable_gloo_process_groups,
         )
     else:
         optimizer = get_megatron_muon_optimizer(

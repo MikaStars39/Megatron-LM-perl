@@ -155,6 +155,31 @@ class OptimizerConfig:
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
 
+    # Roo (Matrix Natural Gradient)
+    roo_momentum: float = 0.95
+    """Momentum coefficient for Roo optimizer."""
+
+    roo_epsilon: float = 0.01
+    """Regularization epsilon for Roo inverse-spectral transform. Controls the crossover
+    point: singular values >> eps are damped (1/sigma), those << eps are amplified (sigma/eps^2)."""
+
+    roo_scale_factor: float = 1.0
+    """Scale factor applied after RMS normalization of the Roo update."""
+
+    roo_split_qkv: bool = True
+    """Whether to split QKV parameters for Roo optimizer."""
+
+    roo_tp_mode: str = "allreduce_gram"
+    """TP handling mode for Roo gram matrix computation.
+    'allreduce_gram': allreduce M^T M across TP ranks for row-parallel params.
+    'blockwise': treat each TP shard independently (no communication)."""
+
+    roo_num_ns_steps: int = 5
+    """Number of Newton-Schulz iteration steps for gram matrix inversion."""
+
+    roo_fp32_matmul_prec: str = "medium"
+    """FP32 matmul precision for Newton-Schulz iteration in Roo ('low', 'medium', 'high')."""
+
     #######################
     # Distributed optimizer
     #######################
