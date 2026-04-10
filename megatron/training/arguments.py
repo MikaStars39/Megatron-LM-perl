@@ -1238,6 +1238,20 @@ def validate_args(args, defaults={}):
         assert not args.use_megatron_fsdp, "Roo optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Roo optimizer supports torch and torch_dist checkpoint format."
 
+    # RooNormal optimizer check
+    if args.optimizer == 'roo_normal':
+        assert not args.use_distributed_optimizer, "RooNormal optimizer does not support distributed optimizer."
+        assert not args.use_torch_fsdp2, "RooNormal optimizer does not support Torch-FSDP2."
+        assert not args.use_megatron_fsdp, "RooNormal optimizer does not support Megatron-FSDP."
+        assert args.ckpt_format in ["torch", "torch_dist"], "RooNormal optimizer supports torch and torch_dist checkpoint format."
+
+    # MuonProjected optimizer check
+    if args.optimizer == 'muon_projected':
+        assert not args.use_distributed_optimizer, "MuonProjected does not support distributed optimizer."
+        assert not args.use_torch_fsdp2, "MuonProjected does not support Torch-FSDP2."
+        assert not args.use_megatron_fsdp, "MuonProjected does not support Megatron-FSDP."
+        assert args.ckpt_format in ["torch", "torch_dist"], "MuonProjected supports torch and torch_dist checkpoint format."
+
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (
@@ -2088,6 +2102,51 @@ def _add_regularization_args(parser):
                        choices=['low', 'medium', 'high'],
                        help='FP32 matmul precision for Newton-Schulz iteration in Roo')
 
+    # RooNormal (SVD-based spectral clipping with Muon-style EMA)
+    group.add_argument('--roo-normal-momentum', type=float, default=0.95,
+                       help='Momentum coefficient (β) for RooNormal EMA')
+    group.add_argument('--roo-normal-clip-value', type=float, default=20.0,
+                       help='Singular value clipping threshold: f(σ) = min(1/(σ+ε), clip_value)')
+    group.add_argument('--roo-normal-epsilon', type=float, default=1e-7,
+                       help='Small constant before reciprocal to prevent division by zero')
+    group.add_argument('--roo-normal-scale-factor', type=float, default=1.0,
+                       help='Scale factor after RMS normalization for RooNormal')
+    group.add_argument('--roo-normal-no-nesterov', action='store_false', default=True,
+                       dest='roo_normal_use_nesterov',
+                       help='Disable Nesterov-style momentum for RooNormal')
+    group.add_argument('--roo-normal-no-split-qkv', action='store_false', default=True,
+                       dest='roo_normal_split_qkv',
+                       help='Disable QKV splitting for RooNormal optimizer')
+    group.add_argument('--roo-normal-svd-log-interval', type=int, default=10,
+                       help='Log SVD singular value stats every N steps (0 disables)')
+    group.add_argument('--roo-normal-svd-log-dir', type=str, default='',
+                       help='Directory to write SVD singular value logs (empty = no file log)')
+
+    # MuonProjected (Muon with initial-weight projection)
+    group.add_argument('--muon-projected-momentum', type=float, default=0.95,
+                       help='Momentum coefficient (beta) for MuonProjected EMA')
+    group.add_argument('--muon-projected-no-nesterov', action='store_false', default=True,
+                       dest='muon_projected_use_nesterov',
+                       help='Disable Nesterov-style momentum for MuonProjected')
+    group.add_argument('--muon-projected-projection-alpha', type=float, default=0.5,
+                       help='Coefficient alpha in (I - alpha * W0 @ W0^T)')
+    group.add_argument('--muon-projected-no-split-qkv', action='store_false', default=True,
+                       dest='muon_projected_split_qkv',
+                       help='Disable QKV splitting for MuonProjected optimizer')
+    group.add_argument('--muon-projected-num-ns-steps', type=int, default=5,
+                       help='Number of Newton-Schulz steps for MuonProjected')
+    group.add_argument('--muon-projected-scale-mode', type=str, default='spectral',
+                       choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
+                       help='Scale mode for MuonProjected')
+    group.add_argument('--muon-projected-extra-scale-factor', type=float, default=1.0,
+                       help='Extra scale factor for MuonProjected')
+    group.add_argument('--muon-projected-fp32-matmul-prec', type=str, default='medium',
+                       choices=['low', 'medium', 'high'],
+                       help='FP32 matmul precision for MuonProjected NS iteration')
+    group.add_argument('--muon-projected-tp-mode', type=str, default='blockwise',
+                       choices=['blockwise', 'duplicated', 'distributed'],
+                       help='TP mode for MuonProjected')
+
     return parser
 
 
@@ -2338,7 +2397,7 @@ def _add_training_args(parser):
     group.add_argument('--qk-clip-threshold', type=float, default=100,
                        help='The balancing threshold for qk-clip.')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'roo'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'roo', 'roo_normal', 'muon_projected'],
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')

@@ -180,6 +180,59 @@ class OptimizerConfig:
     roo_fp32_matmul_prec: str = "medium"
     """FP32 matmul precision for Newton-Schulz iteration in Roo ('low', 'medium', 'high')."""
 
+    # RooNormal (SVD-based spectral clipping with Muon-style EMA)
+    roo_normal_momentum: float = 0.95
+    """Momentum coefficient (β) for RooNormal EMA: buf = β*buf + (1-β)*grad."""
+
+    roo_normal_clip_value: float = 20.0
+    """Singular value clipping threshold: f(σ) = min(1/(σ+ε), clip_value)."""
+
+    roo_normal_epsilon: float = 1e-7
+    """Small constant added before reciprocal to prevent division by zero."""
+
+    roo_normal_scale_factor: float = 1.0
+    """Scale factor applied after RMS normalization of the RooNormal update."""
+
+    roo_normal_use_nesterov: bool = True
+    """Whether to use Nesterov-style momentum (same as Muon default)."""
+
+    roo_normal_split_qkv: bool = True
+    """Whether to split QKV parameters for RooNormal optimizer."""
+
+    roo_normal_svd_log_interval: int = 10
+    """Log SVD singular value statistics every N steps. 0 disables logging."""
+
+    roo_normal_svd_log_dir: str = ""
+    """Directory to write SVD singular value logs. Empty string disables file logging."""
+
+    # MuonProjected (Muon with initial-weight projection)
+    muon_projected_momentum: float = 0.95
+    """Momentum coefficient (beta) for MuonProjected EMA."""
+
+    muon_projected_use_nesterov: bool = True
+    """Whether to use Nesterov-style momentum for MuonProjected."""
+
+    muon_projected_projection_alpha: float = 0.5
+    """Coefficient for the projection: (I - alpha * W0 @ W0^T)."""
+
+    muon_projected_split_qkv: bool = True
+    """Whether to split QKV parameters for MuonProjected optimizer."""
+
+    muon_projected_num_ns_steps: int = 5
+    """Number of Newton-Schulz iteration steps for Muon orthogonalization."""
+
+    muon_projected_scale_mode: str = "spectral"
+    """Scale mode for Muon update ('spectral', 'unit_rms_norm', 'shape_scaling')."""
+
+    muon_projected_extra_scale_factor: float = 1.0
+    """Additional scale factor for the Muon update."""
+
+    muon_projected_fp32_matmul_prec: str = "medium"
+    """FP32 matmul precision for NS iteration ('low', 'medium', 'high')."""
+
+    muon_projected_tp_mode: str = "blockwise"
+    """TP mode for Newton-Schulz and projection ('blockwise', 'duplicated', 'distributed')."""
+
     #######################
     # Distributed optimizer
     #######################
