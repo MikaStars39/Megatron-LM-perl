@@ -177,16 +177,23 @@ class MuonProjected(torch.optim.Optimizer):
         """Apply (I - alpha * W0_hat @ W0_hat^T) @ muon_update.
 
         W0_hat = W0 / ||W0||_F is precomputed in capture_initial_weights().
-        Efficient form: muon_update - alpha * W0_hat @ (W0_hat^T @ muon_update)
+        Uses associativity to pick the order with smaller intermediate matrix:
+          m <= n: (W0_hat @ W0_hat^T) @ G, intermediate [m, m]
+          m >  n: W0_hat @ (W0_hat^T @ G), intermediate [n, n]
         """
         orig_dtype = muon_update.dtype
         muon_f32 = muon_update.float()
-        W0h_f32 = W0_hat.float()
+        W0h_f32 = W0_hat.detach().float()
 
-        # W0_hat^T @ muon_update: [n, m] @ [m, n] = [n, n]
-        intermediate = W0h_f32.t() @ muon_f32
-        # W0_hat @ intermediate: [m, n] @ [n, n] = [m, n]
-        projection_term = W0h_f32 @ intermediate
+        m, n = W0h_f32.shape
+        if m <= n:
+            # Left-to-right: intermediate [m, m] (smaller for wide matrices)
+            gram = W0h_f32 @ W0h_f32.t()          # [m, m]
+            projection_term = gram @ muon_f32       # [m, m] @ [m, n] = [m, n]
+        else:
+            # Right-to-left: intermediate [n, n] (smaller for tall matrices)
+            intermediate = W0h_f32.t() @ muon_f32   # [n, n]
+            projection_term = W0h_f32 @ intermediate # [m, n] @ [n, n] = [m, n]
 
         result = muon_f32 - self.projection_alpha * projection_term
         return result.to(orig_dtype)
@@ -252,9 +259,9 @@ class MuonProjected(torch.optim.Optimizer):
                     state = self.state[p]
                     if 'momentum_buffer' not in state:
                         state['momentum_buffer'] = torch.zeros_like(p.data)
-                    W0_f32 = p.data.float()
+                    W0_f32 = p.data.detach().float()
                     fnorm = W0_f32.norm()  # Frobenius norm
-                    state['W0_hat'] = (W0_f32 / fnorm.clamp_min(1e-12)).to(torch.bfloat16)
+                    state['W0_hat'] = (W0_f32 / fnorm.clamp_min(1e-12)).to(torch.bfloat16).detach()
                     count += 1
         log_single_rank(
             logger, logging.INFO,
@@ -312,9 +319,9 @@ class MuonProjected(torch.optim.Optimizer):
 
                 # Lazy W0_hat capture (fallback if capture_initial_weights wasn't called)
                 if 'W0_hat' not in state:
-                    W0_f32 = p.data.float()
+                    W0_f32 = p.data.detach().float()
                     fnorm = W0_f32.norm()
-                    state['W0_hat'] = (W0_f32 / fnorm.clamp_min(1e-12)).to(torch.bfloat16)
+                    state['W0_hat'] = (W0_f32 / fnorm.clamp_min(1e-12)).to(torch.bfloat16).detach()
 
                 # Get TP info
                 tp_group, partition_dim = self._get_tp_info(p)
