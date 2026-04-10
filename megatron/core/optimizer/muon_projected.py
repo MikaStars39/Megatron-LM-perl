@@ -1,16 +1,16 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""MuonProjected optimizer: Muon with initial-weight projection.
+"""MuonProjected optimizer: Muon with current-weight projection.
 
-Applies projection (I - alpha * W0 @ W0^T) after Muon orthogonalization:
+Applies projection (I - alpha * W @ W^T / ||W||_F^2) after Muon orthogonalization:
 
     M_t = beta * M_{t-1} + (1-beta) * G_t          # EMA momentum (Muon-style)
     G_nesterov = lerp(G_t, M_t, beta)               # Nesterov lookahead (optional)
     Phi = NewtonSchulz(G_nesterov) * scale           # Muon orthogonalization
-    Phi_proj = Phi - alpha * W0_hat @ (W0_hat^T @ Phi)       # Projection (W0_hat = W0/||W0||_F, precomputed)
+    Phi_proj = Phi - alpha * W @ (W^T @ Phi) / ||W||_F^2    # Projection (W = current weight)
     W_t = W_{t-1} - lr * (Phi_proj + lambda * W_{t-1})  # Update (decoupled WD)
 
-W0 is the initial weight captured after checkpoint loading, fixed throughout training.
+W is the current weight at each step (synchronous computation, no precomputation).
 """
 
 import logging
@@ -47,9 +47,10 @@ logger = logging.getLogger(__name__)
 
 
 class MuonProjected(torch.optim.Optimizer):
-    """MuonProjected: Muon with initial-weight projection.
+    """MuonProjected: Muon with current-weight projection.
 
-    Applies (I - alpha * W0 @ W0^T) @ Muon(G) as the parameter update.
+    Applies (I - alpha * W @ W^T / ||W||_F^2) @ Muon(G) as the parameter update.
+    W is the current weight at each step (synchronous, no precomputation).
     Only applies the Muon+projection transform to 2D parameters.
 
     Args:
@@ -173,46 +174,45 @@ class MuonProjected(torch.optim.Optimizer):
         torch.set_float32_matmul_precision(orig_prec)
         return result.to(orig_dtype)
 
-    def _apply_projection(self, muon_update: torch.Tensor, W0_hat: torch.Tensor) -> torch.Tensor:
-        """Apply (I - alpha * W0_hat @ W0_hat^T) @ muon_update.
+    def _apply_projection(self, muon_update: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
+        """Apply (I - alpha * W @ W^T / ||W||_F^2) @ muon_update.
 
-        W0_hat = W0 / ||W0||_F is precomputed in capture_initial_weights().
+        Computes synchronously from current weight W each step (no precomputation).
         Uses associativity to pick the order with smaller intermediate matrix:
-          m <= n: (W0_hat @ W0_hat^T) @ G, intermediate [m, m]
-          m >  n: W0_hat @ (W0_hat^T @ G), intermediate [n, n]
+          m <= n: (W @ W^T) @ G / ||W||_F^2, intermediate [m, m]
+          m >  n: W @ (W^T @ G) / ||W||_F^2, intermediate [n, n]
         """
         orig_dtype = muon_update.dtype
         muon_f32 = muon_update.float()
-        W0h_f32 = W0_hat.detach().float()
+        W_f32 = W.detach().float()
+        fnorm_sq = W_f32.norm().square().clamp_min(1e-12)
 
-        m, n = W0h_f32.shape
+        m, n = W_f32.shape
         if m <= n:
-            # Left-to-right: intermediate [m, m] (smaller for wide matrices)
-            gram = W0h_f32 @ W0h_f32.t()          # [m, m]
-            projection_term = gram @ muon_f32       # [m, m] @ [m, n] = [m, n]
+            gram = W_f32 @ W_f32.t()            # [m, m]
+            projection_term = gram @ muon_f32    # [m, m] @ [m, n] = [m, n]
         else:
-            # Right-to-left: intermediate [n, n] (smaller for tall matrices)
-            intermediate = W0h_f32.t() @ muon_f32   # [n, n]
-            projection_term = W0h_f32 @ intermediate # [m, n] @ [n, n] = [m, n]
+            intermediate = W_f32.t() @ muon_f32  # [n, n]
+            projection_term = W_f32 @ intermediate  # [m, n]
 
-        result = muon_f32 - self.projection_alpha * projection_term
+        result = muon_f32 - self.projection_alpha * projection_term / fnorm_sq
         return result.to(orig_dtype)
 
     def _transform_single(
         self,
         update: torch.Tensor,
-        W0: torch.Tensor,
+        W: torch.Tensor,
         tp_group: Optional[torch.distributed.ProcessGroup],
         partition_dim: Optional[int],
     ) -> torch.Tensor:
         """Apply Muon orthogonalization + projection to a single 2D tensor."""
         muon_update = self._muon_orthogonalize_single(update, tp_group, partition_dim)
-        return self._apply_projection(muon_update, W0)
+        return self._apply_projection(muon_update, W)
 
     def _transform_qkv(
         self,
         update: torch.Tensor,
-        W0: torch.Tensor,
+        W: torch.Tensor,
         tp_group: Optional[torch.distributed.ProcessGroup],
         partition_dim: Optional[int],
     ) -> torch.Tensor:
@@ -228,52 +228,22 @@ class MuonProjected(torch.optim.Optimizer):
         )
         update_parts = [g.reshape(-1, grad_shape[-1]) for g in update_parts]
 
-        # Split W0 the same way
-        W0_parts = torch.split(
-            W0.view(num_query_groups, sum(self.qkv_split_shapes), -1),
+        # Split W the same way
+        W_parts = torch.split(
+            W.view(num_query_groups, sum(self.qkv_split_shapes), -1),
             self.qkv_split_shapes,
             dim=1,
         )
-        W0_parts = [g.reshape(-1, grad_shape[-1]) for g in W0_parts]
+        W_parts = [g.reshape(-1, grad_shape[-1]) for g in W_parts]
 
         # Apply transform to each Q, K, V component independently
         qkv_transformed = [
             self._transform_single(u, w, tp_group, partition_dim).view(
                 num_query_groups, -1, grad_shape[-1]
             )
-            for u, w in zip(update_parts, W0_parts)
+            for u, w in zip(update_parts, W_parts)
         ]
         return torch.cat(qkv_transformed, dim=1).view(grad_shape)
-
-    def capture_initial_weights(self):
-        """Capture normalized W0_hat = W0 / ||W0||_F for the projection.
-
-        Must be called AFTER checkpoint loading so W0 reflects the pretrained weights.
-        Precomputes the normalized W0 so that each step only needs:
-            muon_update - alpha * W0_hat @ (W0_hat^T @ muon_update)
-        """
-        count = 0
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.data.ndim == 2:
-                    state = self.state[p]
-                    if 'momentum_buffer' not in state:
-                        state['momentum_buffer'] = torch.zeros_like(p.data)
-                    W0_f32 = p.data.detach().float()
-                    fnorm = W0_f32.norm()  # Frobenius norm
-                    state['W0_hat'] = (W0_f32 / fnorm.clamp_min(1e-12)).to(torch.bfloat16).detach()
-                    count += 1
-        log_single_rank(
-            logger, logging.INFO,
-            f'MuonProjected: captured W0_hat for {count} parameters (projection_alpha={self.projection_alpha})'
-        )
-
-    def state_dict(self):
-        """Override to exclude W0_hat from checkpoint (re-captured after load)."""
-        sd = super().state_dict()
-        for state in sd['state'].values():
-            state.pop('W0_hat', None)
-        return sd
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -317,20 +287,14 @@ class MuonProjected(torch.optim.Optimizer):
                     p.data.add_(update, alpha=-lr)
                     continue
 
-                # Lazy W0_hat capture (fallback if capture_initial_weights wasn't called)
-                if 'W0_hat' not in state:
-                    W0_f32 = p.data.detach().float()
-                    fnorm = W0_f32.norm()
-                    state['W0_hat'] = (W0_f32 / fnorm.clamp_min(1e-12)).to(torch.bfloat16).detach()
-
                 # Get TP info
                 tp_group, partition_dim = self._get_tp_info(p)
 
-                # Apply Muon orthogonalization + projection
+                # Apply Muon orthogonalization + projection (using current weight)
                 if self.split_qkv and self.is_qkv_fn is not None and self.is_qkv_fn(p):
-                    phi = self._transform_qkv(update, state['W0_hat'], tp_group, partition_dim)
+                    phi = self._transform_qkv(update, p.data, tp_group, partition_dim)
                 else:
-                    phi = self._transform_single(update, state['W0_hat'], tp_group, partition_dim)
+                    phi = self._transform_single(update, p.data, tp_group, partition_dim)
 
                 # Decoupled weight decay: W = (1 - lr*lambda) W - lr*Phi
                 if weight_decay != 0:
