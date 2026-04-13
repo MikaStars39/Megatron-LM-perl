@@ -246,6 +246,27 @@ class OptimizerConfig:
     muon_projected_tp_mode: str = "blockwise"
     """TP mode for Newton-Schulz and projection ('blockwise', 'duplicated', 'distributed')."""
 
+    # GASD (Geometry-Aware Steepest Descent)
+    gasd_momentum: float = 0.95
+    """Momentum coefficient (beta) for GASD EMA."""
+
+    gasd_use_nesterov: bool = True
+    """Whether to use Nesterov-style momentum for GASD."""
+
+    gasd_epsilon_alpha: float = 1.0
+    """Coefficient for adaptive epsilon: eps = alpha * ||W||_F^2 / min(n, m).
+    Controls the off-principal amplification strength. Larger = more SGD-like,
+    smaller = more aggressive off-principal amplification."""
+
+    gasd_cg_iters: int = 10
+    """Number of Conjugate Gradient iterations for solving (WW^T + eps*I) Delta = G."""
+
+    gasd_rms_scale: float = 1.0
+    """Scale factor applied after RMS normalization of the CG output."""
+
+    gasd_split_qkv: bool = True
+    """Whether to split QKV parameters for GASD optimizer."""
+
     # SOAP (ShampoO with Adam in the Preconditioner eigenbasis).
     soap_beta1: float = 0.9
     """First coefficient for inner Adam in SOAP optimizer."""

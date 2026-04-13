@@ -1252,6 +1252,13 @@ def validate_args(args, defaults={}):
         assert not args.use_megatron_fsdp, "MuonProjected does not support Megatron-FSDP."
         assert args.ckpt_format in ["torch", "torch_dist"], "MuonProjected supports torch and torch_dist checkpoint format."
 
+    # GASD optimizer check
+    if args.optimizer == 'gasd':
+        assert not args.use_distributed_optimizer, "GASD does not support distributed optimizer."
+        assert not args.use_torch_fsdp2, "GASD does not support Torch-FSDP2."
+        assert not args.use_megatron_fsdp, "GASD does not support Megatron-FSDP."
+        assert args.ckpt_format in ["torch", "torch_dist"], "GASD supports torch and torch_dist checkpoint format."
+
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (
@@ -2147,6 +2154,22 @@ def _add_regularization_args(parser):
                        choices=['blockwise', 'duplicated', 'distributed'],
                        help='TP mode for MuonProjected')
 
+    # GASD (Geometry-Aware Steepest Descent)
+    group.add_argument('--gasd-momentum', type=float, default=0.95,
+                       help='Momentum coefficient (beta) for GASD EMA')
+    group.add_argument('--gasd-no-nesterov', action='store_false', default=True,
+                       dest='gasd_use_nesterov',
+                       help='Disable Nesterov-style momentum for GASD')
+    group.add_argument('--gasd-epsilon-alpha', type=float, default=1.0,
+                       help='Coefficient for adaptive epsilon: eps = alpha * ||W||_F^2 / min(n,m)')
+    group.add_argument('--gasd-cg-iters', type=int, default=10,
+                       help='Number of CG iterations for GASD')
+    group.add_argument('--gasd-rms-scale', type=float, default=1.0,
+                       help='Scale factor after RMS normalization of GASD CG output')
+    group.add_argument('--gasd-no-split-qkv', action='store_false', default=True,
+                       dest='gasd_split_qkv',
+                       help='Disable QKV splitting for GASD optimizer')
+
     return parser
 
 
@@ -2397,7 +2420,7 @@ def _add_training_args(parser):
     group.add_argument('--qk-clip-threshold', type=float, default=100,
                        help='The balancing threshold for qk-clip.')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'roo', 'roo_normal', 'muon_projected'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'roo', 'roo_normal', 'muon_projected', 'gasd'],
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
