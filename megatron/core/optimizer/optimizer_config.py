@@ -267,6 +267,21 @@ class OptimizerConfig:
     gasd_split_qkv: bool = True
     """Whether to split QKV parameters for GASD optimizer."""
 
+    gasd_num_ns_steps: int = 5
+    """Number of Newton-Schulz iteration steps for Muon orthogonalization in GASD."""
+
+    gasd_scale_mode: str = "spectral"
+    """Scale mode for Muon update in GASD ('spectral', 'unit_rms_norm', 'shape_scaling')."""
+
+    gasd_extra_scale_factor: float = 1.0
+    """Additional scale factor for the Muon update in GASD."""
+
+    gasd_fp32_matmul_prec: str = "medium"
+    """FP32 matmul precision for NS iteration in GASD ('low', 'medium', 'high')."""
+
+    gasd_tp_mode: str = "blockwise"
+    """TP mode for Newton-Schulz and GASD CG ('blockwise', 'duplicated', 'distributed')."""
+
     # SOAP (ShampoO with Adam in the Preconditioner eigenbasis).
     soap_beta1: float = 0.9
     """First coefficient for inner Adam in SOAP optimizer."""

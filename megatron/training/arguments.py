@@ -2176,6 +2176,19 @@ def _add_regularization_args(parser):
     group.add_argument('--gasd-no-split-qkv', action='store_false', default=True,
                        dest='gasd_split_qkv',
                        help='Disable QKV splitting for GASD optimizer')
+    group.add_argument('--gasd-num-ns-steps', type=int, default=5,
+                       help='Number of Newton-Schulz steps for GASD Muon normalization')
+    group.add_argument('--gasd-scale-mode', type=str, default='spectral',
+                       choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
+                       help='Scale mode for GASD Muon update')
+    group.add_argument('--gasd-extra-scale-factor', type=float, default=1.0,
+                       help='Extra scale factor for GASD Muon update')
+    group.add_argument('--gasd-fp32-matmul-prec', type=str, default='medium',
+                       choices=['low', 'medium', 'high'],
+                       help='FP32 matmul precision for GASD NS iteration')
+    group.add_argument('--gasd-tp-mode', type=str, default='blockwise',
+                       choices=['blockwise', 'duplicated', 'distributed'],
+                       help='TP mode for GASD')
 
     # RMSprop
     group.add_argument('--rmsprop-alpha', type=float, default=0.99,
