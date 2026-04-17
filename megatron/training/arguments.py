@@ -1252,6 +1252,20 @@ def validate_args(args, defaults={}):
         assert not args.use_megatron_fsdp, "MuonProjected does not support Megatron-FSDP."
         assert args.ckpt_format in ["torch", "torch_dist"], "MuonProjected supports torch and torch_dist checkpoint format."
 
+    # GASD optimizer check
+    if args.optimizer == 'gasd':
+        assert not args.use_distributed_optimizer, "GASD does not support distributed optimizer."
+        assert not args.use_torch_fsdp2, "GASD does not support Torch-FSDP2."
+        assert not args.use_megatron_fsdp, "GASD does not support Megatron-FSDP."
+        assert args.ckpt_format in ["torch", "torch_dist"], "GASD supports torch and torch_dist checkpoint format."
+
+    # SOAP optimizer check
+    if args.optimizer == 'soap':
+        assert not args.use_distributed_optimizer, "SOAP does not support distributed optimizer."
+        assert not args.use_torch_fsdp2, "SOAP does not support Torch-FSDP2."
+        assert not args.use_megatron_fsdp, "SOAP does not support Megatron-FSDP."
+        assert args.ckpt_format in ["torch", "torch_dist"], "SOAP supports torch and torch_dist checkpoint format."
+
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (
@@ -2147,6 +2161,77 @@ def _add_regularization_args(parser):
                        choices=['blockwise', 'duplicated', 'distributed'],
                        help='TP mode for MuonProjected')
 
+    # GASD (Geometry-Aware Steepest Descent)
+    group.add_argument('--gasd-momentum', type=float, default=0.95,
+                       help='Momentum coefficient (beta) for GASD EMA')
+    group.add_argument('--gasd-no-nesterov', action='store_false', default=True,
+                       dest='gasd_use_nesterov',
+                       help='Disable Nesterov-style momentum for GASD')
+    group.add_argument('--gasd-epsilon-alpha', type=float, default=1.0,
+                       help='Coefficient for adaptive epsilon: eps = alpha * ||W||_F^2 / min(n,m)')
+    group.add_argument('--gasd-cg-iters', type=int, default=10,
+                       help='Number of CG iterations for GASD')
+    group.add_argument('--gasd-rms-scale', type=float, default=1.0,
+                       help='Scale factor after RMS normalization of GASD CG output')
+    group.add_argument('--gasd-no-split-qkv', action='store_false', default=True,
+                       dest='gasd_split_qkv',
+                       help='Disable QKV splitting for GASD optimizer')
+    group.add_argument('--gasd-num-ns-steps', type=int, default=5,
+                       help='Number of Newton-Schulz steps for GASD Muon normalization')
+    group.add_argument('--gasd-scale-mode', type=str, default='spectral',
+                       choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
+                       help='Scale mode for GASD Muon update')
+    group.add_argument('--gasd-extra-scale-factor', type=float, default=1.0,
+                       help='Extra scale factor for GASD Muon update')
+    group.add_argument('--gasd-fp32-matmul-prec', type=str, default='medium',
+                       choices=['low', 'medium', 'high'],
+                       help='FP32 matmul precision for GASD NS iteration')
+    group.add_argument('--gasd-tp-mode', type=str, default='blockwise',
+                       choices=['blockwise', 'duplicated', 'distributed'],
+                       help='TP mode for GASD')
+
+    # RMSprop
+    group.add_argument('--rmsprop-alpha', type=float, default=0.99,
+                       help='Smoothing constant (decay rate) for RMSprop')
+    group.add_argument('--rmsprop-eps', type=float, default=1e-8,
+                       help='Term added to denominator for numerical stability in RMSprop')
+    group.add_argument('--rmsprop-momentum', type=float, default=0.0,
+                       help='Momentum factor for RMSprop')
+    group.add_argument('--rmsprop-centered', action='store_true', default=False,
+                       help='Use centered RMSprop (gradient normalized by variance)')
+
+    # SOAP (ShampoO with Adam in the Preconditioner eigenbasis)
+    group.add_argument('--soap-beta1', type=float, default=0.9,
+                       help='First coefficient for inner Adam in SOAP')
+    group.add_argument('--soap-beta2', type=float, default=0.95,
+                       help='Second coefficient for inner Adam in SOAP')
+    group.add_argument('--soap-shampoo-beta', type=float, default=0.95,
+                       help='Beta for Kronecker factor matrices moving average in SOAP')
+    group.add_argument('--soap-eps', type=float, default=1e-8,
+                       help='Inner Adam epsilon for numerical stability in SOAP')
+    group.add_argument('--soap-precondition-frequency', type=int, default=1,
+                       help='How often to update the preconditioner eigenbasis in SOAP')
+    group.add_argument('--soap-adam-warmup-steps', type=int, default=0,
+                       help='Number of steps using plain Adam before enabling preconditioning in SOAP')
+    group.add_argument('--soap-correct-bias', action='store_true', default=True,
+                       help='Whether to use bias correction in SOAP')
+    group.add_argument('--soap-no-correct-bias', action='store_false', dest='soap_correct_bias',
+                       help='Disable bias correction in SOAP')
+    group.add_argument('--soap-fp32-matmul-prec', type=str, default='high',
+                       choices=['low', 'medium', 'high'],
+                       help='Precision of matmul operations in SOAP optimizer')
+    group.add_argument('--soap-use-eigh', action='store_true', default=False,
+                       help='Use full symmetric eigendecomposition (eigh) for eigenbasis in SOAP')
+    group.add_argument('--soap-power-iter-steps', type=int, default=1,
+                       help='Number of power iteration steps before QR decomposition in SOAP')
+    group.add_argument('--soap-max-update-rms', type=float, default=0.0,
+                       help='Clip the update RMS to this value in SOAP (0 = no clipping)')
+    group.add_argument('--soap-nesterov', action='store_true', default=False,
+                       help='Use Nesterov momentum in SOAP')
+    group.add_argument('--soap-no-split-qkv', action='store_false', default=True,
+                       dest='soap_split_qkv',
+                       help='Disable QKV splitting for SOAP optimizer')
+
     return parser
 
 
@@ -2397,7 +2482,7 @@ def _add_training_args(parser):
     group.add_argument('--qk-clip-threshold', type=float, default=100,
                        help='The balancing threshold for qk-clip.')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'roo', 'roo_normal', 'muon_projected'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'roo', 'roo_normal', 'muon_projected', 'gasd', 'rmsprop', 'soap'],
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')

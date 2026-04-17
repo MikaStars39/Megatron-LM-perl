@@ -1,16 +1,24 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""MuonProjected optimizer: Muon with current-weight projection.
+"""GASD optimizer: Geometry-Aware Steepest Descent for RLVR.
 
-Applies projection (I - alpha * W @ W^T / ||W||_F^2) after Muon orthogonalization:
+Applies Muon orthogonalization first, then GASD preconditioning via CG:
 
-    M_t = beta * M_{t-1} + (1-beta) * G_t          # EMA momentum (Muon-style)
+    M_t = beta * M_{t-1} + (1-beta) * G_t          # EMA momentum
     G_nesterov = lerp(G_t, M_t, beta)               # Nesterov lookahead (optional)
     Phi = NewtonSchulz(G_nesterov) * scale           # Muon orthogonalization
-    Phi_proj = Phi - alpha * W @ (W^T @ Phi) / ||W||_F^2    # Projection (W = current weight)
-    W_t = W_{t-1} - lr * (Phi_proj + lambda * W_{t-1})  # Update (decoupled WD)
+    Solve (WW^T + eps*I) Delta = Phi via CG          # GASD preconditioning
+    Delta = Delta / RMS(Delta) * scale               # RMS normalization
+    W_t = W_{t-1} - lr * (Delta + lambda * W_{t-1})  # Update (decoupled WD)
 
-W is the current weight at each step (synchronous computation, no precomputation).
+The GASD preconditioner (WW^T + eps*I)^{-1} encodes the weight's spectral
+structure: principal directions (large singular values) are damped, while
+off-principal directions (small singular values) are amplified. This matches
+the Three-Gate Theory observation that RLVR updates preferentially occur in
+off-principal subspaces.
+
+W is the current weight at each step (recomputed every step).
+eps is computed adaptively per layer: eps = alpha * ||W||_F^2 / min(n, m).
 """
 
 import logging
@@ -46,12 +54,16 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-class MuonProjected(torch.optim.Optimizer):
-    """MuonProjected: Muon with current-weight projection.
+class GASD(torch.optim.Optimizer):
+    """GASD: Geometry-Aware Steepest Descent.
 
-    Applies (I - alpha * W @ W^T / ||W||_F^2) @ Muon(G) as the parameter update.
-    W is the current weight at each step (synchronous, no precomputation).
-    Only applies the Muon+projection transform to 2D parameters.
+    Applies Muon orthogonalization (Newton-Schulz) for gradient normalization,
+    then solves (WW^T + eps*I) Delta = Phi via Conjugate Gradient to precondition
+    the update based on the current weight's spectral geometry.
+    Finally applies RMS normalization to stabilize the update magnitude.
+
+    Only applies the Muon+GASD transform to 2D parameters.
+    Non-2D parameters (embedding, LayerNorm, bias) are updated directly.
 
     Args:
         params: Parameters to optimize.
@@ -59,11 +71,13 @@ class MuonProjected(torch.optim.Optimizer):
         momentum: Momentum coefficient (beta) for EMA.
         weight_decay: Decoupled weight decay coefficient.
         use_nesterov: Whether to use Nesterov-style momentum.
-        projection_alpha: Coefficient for the projection (default 0.5).
+        epsilon_alpha: Coefficient for adaptive epsilon: eps = alpha * ||W||_F^2 / min(n,m).
+        cg_iters: Number of Conjugate Gradient iterations (default 10).
+        rms_scale: Scale factor after RMS normalization of the CG output (default 1.0).
         split_qkv: Whether to split QKV parameters.
         is_qkv_fn: Function to check if a parameter is QKV.
         qkv_split_shapes: Shapes for QKV splitting.
-        num_ns_steps: Number of Newton-Schulz iteration steps.
+        num_ns_steps: Number of Newton-Schulz iteration steps for Muon.
         coefficient_type: NS coefficient type.
         scale_mode: Muon scale mode.
         extra_scale_factor: Additional scale factor for the Muon update.
@@ -79,7 +93,9 @@ class MuonProjected(torch.optim.Optimizer):
         momentum: float = 0.95,
         weight_decay: float = 0.01,
         use_nesterov: bool = True,
-        projection_alpha: float = 0.5,
+        epsilon_alpha: float = 1.0,
+        cg_iters: int = 10,
+        rms_scale: float = 1.0,
         split_qkv: bool = False,
         is_qkv_fn: Optional[Callable[[torch.Tensor], bool]] = None,
         qkv_split_shapes: Optional[tuple] = None,
@@ -93,6 +109,8 @@ class MuonProjected(torch.optim.Optimizer):
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
+        if cg_iters < 1:
+            raise ValueError(f"cg_iters must be at least 1, got {cg_iters}")
 
         defaults = dict(
             lr=lr,
@@ -102,7 +120,9 @@ class MuonProjected(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
         self.use_nesterov = use_nesterov
-        self.projection_alpha = projection_alpha
+        self.epsilon_alpha = epsilon_alpha
+        self.cg_iters = cg_iters
+        self.rms_scale = rms_scale
         self.split_qkv = split_qkv
         self.is_qkv_fn = is_qkv_fn
         self.qkv_split_shapes = qkv_split_shapes
@@ -148,7 +168,6 @@ class MuonProjected(torch.optim.Optimizer):
         update_f32 = update.float()
 
         if partition_dim is None:
-            # Non-TP or blockwise: use non-TP newton_schulz directly
             orth = newton_schulz(
                 update_f32,
                 steps=self.num_ns_steps,
@@ -174,29 +193,48 @@ class MuonProjected(torch.optim.Optimizer):
         torch.set_float32_matmul_precision(orig_prec)
         return result.to(orig_dtype)
 
-    def _apply_projection(self, muon_update: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
-        """Apply (I - alpha * W @ W^T / ||W||_F^2) @ muon_update.
+    def _apply_gasd(self, muon_update: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
+        """Solve (WW^T + eps*I) Delta = Phi via batch Conjugate Gradient.
 
-        Computes synchronously from current weight W each step (no precomputation).
-        Uses associativity to pick the order with smaller intermediate matrix:
-          m <= n: (W @ W^T) @ G / ||W||_F^2, intermediate [m, m]
-          m >  n: W @ (W^T @ G) / ||W||_F^2, intermediate [n, n]
+        Avoids forming the [n, n] matrix WW^T explicitly. Each CG iteration
+        only requires two matmuls: v = W^T @ P, then AP = W @ v + eps * P.
+        W is the current weight (recomputed every step).
         """
         orig_dtype = muon_update.dtype
-        muon_f32 = muon_update.float()
+        Phi = muon_update.float()
         W_f32 = W.detach().float()
+        n, m = W_f32.shape
+
+        # Adaptive epsilon: eps = alpha * ||W||_F^2 / min(n, m)
         fnorm_sq = W_f32.norm().square().clamp_min(1e-12)
+        eps = self.epsilon_alpha * fnorm_sq / min(n, m)
 
-        m, n = W_f32.shape
-        if m <= n:
-            gram = W_f32 @ W_f32.t()            # [m, m]
-            projection_term = gram @ muon_f32    # [m, m] @ [m, n] = [m, n]
-        else:
-            intermediate = W_f32.t() @ muon_f32  # [n, n]
-            projection_term = W_f32 @ intermediate  # [m, n]
+        # Batch CG: solve (WW^T + eps*I) Delta = Phi
+        Delta = torch.zeros_like(Phi)
+        R = Phi.clone()
+        P = R.clone()
+        rr = (R * R).sum()
 
-        result = muon_f32 - self.projection_alpha * projection_term / fnorm_sq
-        return result.to(orig_dtype)
+        for _ in range(self.cg_iters):
+            # A @ P = W @ (W^T @ P) + eps * P
+            AP = W_f32 @ (W_f32.t() @ P) + eps * P
+
+            pAp = (P * AP).sum()
+            alpha_cg = rr / pAp.clamp_min(1e-30)
+
+            Delta = Delta + alpha_cg * P
+            R = R - alpha_cg * AP
+
+            rr_new = (R * R).sum()
+            beta_cg = rr_new / rr.clamp_min(1e-30)
+            P = R + beta_cg * P
+            rr = rr_new
+
+        # RMS normalization: Delta = Delta / RMS(Delta) * scale
+        rms = (Delta.square().mean()).sqrt().clamp_min(1e-12)
+        Delta = Delta / rms * self.rms_scale
+
+        return Delta.to(orig_dtype)
 
     def _transform_single(
         self,
@@ -205,9 +243,9 @@ class MuonProjected(torch.optim.Optimizer):
         tp_group: Optional[torch.distributed.ProcessGroup],
         partition_dim: Optional[int],
     ) -> torch.Tensor:
-        """Apply Muon orthogonalization + projection to a single 2D tensor."""
+        """Apply Muon orthogonalization + GASD preconditioning to a single 2D tensor."""
         muon_update = self._muon_orthogonalize_single(update, tp_group, partition_dim)
-        return self._apply_projection(muon_update, W)
+        return self._apply_gasd(muon_update, W)
 
     def _transform_qkv(
         self,
@@ -216,7 +254,7 @@ class MuonProjected(torch.optim.Optimizer):
         tp_group: Optional[torch.distributed.ProcessGroup],
         partition_dim: Optional[int],
     ) -> torch.Tensor:
-        """Apply Muon+projection to QKV parameter by splitting into Q, K, V components."""
+        """Apply Muon+GASD to QKV parameter by splitting into Q, K, V components."""
         grad_shape = update.shape
         num_query_groups = grad_shape[0] // sum(self.qkv_split_shapes)
 
@@ -236,7 +274,7 @@ class MuonProjected(torch.optim.Optimizer):
         )
         W_parts = [g.reshape(-1, grad_shape[-1]) for g in W_parts]
 
-        # Apply transform to each Q, K, V component independently
+        # Apply Muon+GASD to each Q, K, V component independently
         qkv_transformed = [
             self._transform_single(u, w, tp_group, partition_dim).view(
                 num_query_groups, -1, grad_shape[-1]
@@ -247,7 +285,7 @@ class MuonProjected(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
-        """Perform a single MuonProjected optimization step."""
+        """Perform a single GASD optimization step."""
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -271,7 +309,7 @@ class MuonProjected(torch.optim.Optimizer):
 
                 buf = state['momentum_buffer']
 
-                # EMA momentum (Muon-style): buf = beta*buf + (1-beta)*grad
+                # EMA momentum: buf = beta*buf + (1-beta)*grad
                 buf.lerp_(grad, 1 - momentum_beta)
 
                 # Nesterov momentum
@@ -280,7 +318,7 @@ class MuonProjected(torch.optim.Optimizer):
                 else:
                     update = buf
 
-                # Non-2D params: direct update (no Muon/projection)
+                # Non-2D params: direct update (no Muon/GASD)
                 if grad.ndim != 2:
                     if weight_decay != 0:
                         p.data.mul_(1 - lr * weight_decay)
@@ -290,32 +328,32 @@ class MuonProjected(torch.optim.Optimizer):
                 # Get TP info
                 tp_group, partition_dim = self._get_tp_info(p)
 
-                # Apply Muon orthogonalization + projection (using current weight)
+                # Apply Muon orthogonalization + GASD preconditioning
                 if self.split_qkv and self.is_qkv_fn is not None and self.is_qkv_fn(p):
-                    phi = self._transform_qkv(update, p.data, tp_group, partition_dim)
+                    delta = self._transform_qkv(update, p.data, tp_group, partition_dim)
                 else:
-                    phi = self._transform_single(update, p.data, tp_group, partition_dim)
+                    delta = self._transform_single(update, p.data, tp_group, partition_dim)
 
-                # Decoupled weight decay: W = (1 - lr*lambda) W - lr*Phi
+                # Decoupled weight decay: W = (1 - lr*lambda) W - lr*Delta
                 if weight_decay != 0:
                     p.data.mul_(1 - lr * weight_decay)
-                p.data.add_(phi, alpha=-lr)
+                p.data.add_(delta, alpha=-lr)
 
         return loss
 
 
-def get_megatron_muon_projected_optimizer(
+def get_megatron_gasd_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
     config_overrides: Optional[Dict[ParamKey, OptimizerConfig]] = None,
     use_gloo_process_groups: bool = True,
     pg_collection: Optional[ProcessGroupCollection] = None,
 ) -> MegatronOptimizer:
-    """Create MuonProjected optimizer for Megatron model chunks.
+    """Create GASD optimizer for Megatron model chunks.
 
-    Follows the same pattern as get_megatron_roo_optimizer():
+    Follows the same pattern as get_megatron_muon_projected_optimizer():
     1. Split params into linear (2D, non-embedding) and nonlinear
-    2. Freeze nonlinear -> create MuonProjected for linear -> wrap bf16
+    2. Freeze nonlinear -> create GASD for linear -> wrap bf16
     3. Freeze linear -> create Adam for nonlinear
     4. Unfreeze all -> return ChainedOptimizer
 
@@ -327,22 +365,22 @@ def get_megatron_muon_projected_optimizer(
         pg_collection: Process group collection for TP.
 
     Returns:
-        ChainedOptimizer containing MuonProjected (for linear) + Adam (for nonlinear).
+        ChainedOptimizer containing GASD (for linear) + Adam (for nonlinear).
     """
     config.optimizer = 'adam'
 
     assert HAVE_EMERGING_OPTIMIZERS, (
-        "MuonProjected requires 'emerging_optimizers' package. "
+        "GASD requires 'emerging_optimizers' package for Muon orthogonalization. "
         "Install from: https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.1.0"
     )
 
     if config.use_distributed_optimizer:
-        raise Exception('MuonProjected with distributed optimizer is not supported.')
+        raise Exception('GASD with distributed optimizer is not supported.')
 
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
-    log_single_rank(logger, logging.INFO, f'Setting up MuonProjected optimizer with config {config}')
+    log_single_rank(logger, logging.INFO, f'Setting up GASD optimizer with config {config}')
 
     optimizers = []
     linear_params = []
@@ -372,59 +410,51 @@ def get_megatron_muon_projected_optimizer(
             else:
                 nonlinear_params.append(param)
 
-    # === MuonProjected optimizer for linear params ===
+    # === GASD optimizer for linear params ===
     for param in nonlinear_params:
         param.requires_grad = False
 
     linear_param_groups = _get_param_groups(model_chunks, config, config_overrides)
 
-    muon_proj_optimizer = MuonProjected(
+    gasd_optimizer = GASD(
         linear_param_groups,
         lr=config.lr,
-        momentum=config.muon_projected_momentum,
+        momentum=config.gasd_momentum,
         weight_decay=config.weight_decay,
-        use_nesterov=config.muon_projected_use_nesterov,
-        projection_alpha=config.muon_projected_projection_alpha,
-        num_ns_steps=config.muon_projected_num_ns_steps,
-        scale_mode=config.muon_projected_scale_mode,
-        extra_scale_factor=config.muon_projected_extra_scale_factor,
-        fp32_matmul_prec=config.muon_projected_fp32_matmul_prec,
-        tp_mode=config.muon_projected_tp_mode,
-        split_qkv=config.muon_projected_split_qkv,
+        use_nesterov=config.gasd_use_nesterov,
+        epsilon_alpha=config.gasd_epsilon_alpha,
+        cg_iters=config.gasd_cg_iters,
+        rms_scale=config.gasd_rms_scale,
+        num_ns_steps=config.gasd_num_ns_steps,
+        scale_mode=config.gasd_scale_mode,
+        extra_scale_factor=config.gasd_extra_scale_factor,
+        fp32_matmul_prec=config.gasd_fp32_matmul_prec,
+        tp_mode=config.gasd_tp_mode,
+        split_qkv=config.gasd_split_qkv,
         is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
         qkv_split_shapes=qkv_split_shapes,
         pg_collection=pg_collection,
     )
 
-    def muon_projected_init_state_fn(opt, config=None):
+    def gasd_init_state_fn(opt, config=None):
         for group in opt.param_groups:
             for p in group['params']:
                 if len(opt.state[p]) == 0:
                     opt.state[p]['momentum_buffer'] = torch.zeros_like(p.data)
 
-    def adam_init_state_fn(opt, config=None):
-        for group in opt.param_groups:
-            for p in group['params']:
-                if len(opt.state[p]) == 0:
-                    if config is None or not config.use_precision_aware_optimizer:
-                        opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
-                        opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
-                    else:
-                        opt.initialize_state(p)
-
     if config.fp16:
-        raise Exception('MuonProjected with fp16 is not supported.')
+        raise Exception('GASD with fp16 is not supported.')
 
     if config.bf16:
-        muon_proj_wrapped = Float16OptimizerWithFloat16Params(
-            muon_proj_optimizer, config, None, muon_projected_init_state_fn
+        gasd_wrapped = Float16OptimizerWithFloat16Params(
+            gasd_optimizer, config, None, gasd_init_state_fn
         )
     else:
-        muon_proj_wrapped = FP32Optimizer(
-            muon_proj_optimizer, config, muon_projected_init_state_fn
+        gasd_wrapped = FP32Optimizer(
+            gasd_optimizer, config, gasd_init_state_fn
         )
 
-    optimizers.append(muon_proj_wrapped)
+    optimizers.append(gasd_wrapped)
 
     # === Adam optimizer for nonlinear params ===
     for param in nonlinear_params:

@@ -130,6 +130,19 @@ class OptimizerConfig:
     sgd_momentum: float = 0.9
     """Momentum factor for SGD optimizer."""
 
+    # RMSprop.
+    rmsprop_alpha: float = 0.99
+    """Smoothing constant (decay rate) for RMSprop optimizer."""
+
+    rmsprop_eps: float = 1e-8
+    """Term added to the denominator to improve numerical stability in RMSprop optimizer."""
+
+    rmsprop_momentum: float = 0.0
+    """Momentum factor for RMSprop optimizer."""
+
+    rmsprop_centered: bool = False
+    """If true, compute the centered RMSprop (gradient normalized by its variance)."""
+
     # Muon
     muon_momentum: float = 0.95
     """The momentum used by the internal SGD."""
@@ -232,6 +245,82 @@ class OptimizerConfig:
 
     muon_projected_tp_mode: str = "blockwise"
     """TP mode for Newton-Schulz and projection ('blockwise', 'duplicated', 'distributed')."""
+
+    # GASD (Geometry-Aware Steepest Descent)
+    gasd_momentum: float = 0.95
+    """Momentum coefficient (beta) for GASD EMA."""
+
+    gasd_use_nesterov: bool = True
+    """Whether to use Nesterov-style momentum for GASD."""
+
+    gasd_epsilon_alpha: float = 1.0
+    """Coefficient for adaptive epsilon: eps = alpha * ||W||_F^2 / min(n, m).
+    Controls the off-principal amplification strength. Larger = more SGD-like,
+    smaller = more aggressive off-principal amplification."""
+
+    gasd_cg_iters: int = 10
+    """Number of Conjugate Gradient iterations for solving (WW^T + eps*I) Delta = G."""
+
+    gasd_rms_scale: float = 1.0
+    """Scale factor applied after RMS normalization of the CG output."""
+
+    gasd_split_qkv: bool = True
+    """Whether to split QKV parameters for GASD optimizer."""
+
+    gasd_num_ns_steps: int = 5
+    """Number of Newton-Schulz iteration steps for Muon orthogonalization in GASD."""
+
+    gasd_scale_mode: str = "spectral"
+    """Scale mode for Muon update in GASD ('spectral', 'unit_rms_norm', 'shape_scaling')."""
+
+    gasd_extra_scale_factor: float = 1.0
+    """Additional scale factor for the Muon update in GASD."""
+
+    gasd_fp32_matmul_prec: str = "medium"
+    """FP32 matmul precision for NS iteration in GASD ('low', 'medium', 'high')."""
+
+    gasd_tp_mode: str = "blockwise"
+    """TP mode for Newton-Schulz and GASD CG ('blockwise', 'duplicated', 'distributed')."""
+
+    # SOAP (ShampoO with Adam in the Preconditioner eigenbasis).
+    soap_beta1: float = 0.9
+    """First coefficient for inner Adam in SOAP optimizer."""
+
+    soap_beta2: float = 0.95
+    """Second coefficient for inner Adam in SOAP optimizer."""
+
+    soap_shampoo_beta: float = 0.95
+    """Beta for the Kronecker factor matrices moving average in SOAP optimizer."""
+
+    soap_eps: float = 1e-8
+    """Inner Adam epsilon for numerical stability in SOAP optimizer."""
+
+    soap_precondition_frequency: int = 1
+    """How often to update the preconditioner eigenbasis in SOAP optimizer."""
+
+    soap_adam_warmup_steps: int = 0
+    """Number of steps using plain Adam before enabling preconditioning in SOAP optimizer."""
+
+    soap_correct_bias: bool = True
+    """Whether to use bias correction in inner Adam and Kronecker factor EMA."""
+
+    soap_fp32_matmul_prec: str = "high"
+    """Precision of matmul operations in SOAP optimizer ('low', 'medium', 'high')."""
+
+    soap_use_eigh: bool = False
+    """Whether to use full symmetric eigendecomposition (eigh) to compute eigenbasis."""
+
+    soap_power_iter_steps: int = 1
+    """Number of power iteration steps before QR decomposition."""
+
+    soap_max_update_rms: float = 0.0
+    """Clip the update RMS to this value (0 means no clipping)."""
+
+    soap_nesterov: bool = False
+    """Whether to use Nesterov momentum in inner Adam."""
+
+    soap_split_qkv: bool = True
+    """Whether to split QKV parameters for SOAP optimizer."""
 
     #######################
     # Distributed optimizer
