@@ -18,10 +18,12 @@ the Three-Gate Theory observation that RLVR updates preferentially occur in
 off-principal subspaces.
 
 W is the current weight at each step (recomputed every step).
-eps is computed adaptively per layer: eps = alpha * ||W||_F^2 / min(n, m).
+eps is computed adaptively per layer: eps = alpha(t) * ||W||_F^2 / min(n, m),
+where alpha(t) can be annealed from epsilon_alpha to epsilon_alpha_final over training.
 """
 
 import logging
+import math
 from typing import Callable, Dict, List, Optional
 
 import torch
@@ -133,6 +135,7 @@ class GASD(torch.optim.Optimizer):
         self.fp32_matmul_prec = fp32_matmul_prec
         self.tp_mode = tp_mode
         self.pg_collection = pg_collection
+        self._step_count = 0
 
     def _get_tp_info(self, p: torch.Tensor):
         """Get TP group and partition dim for a parameter."""
@@ -205,9 +208,14 @@ class GASD(torch.optim.Optimizer):
         W_f32 = W.detach().float()
         n, m = W_f32.shape
 
-        # Adaptive epsilon: eps = alpha * ||W||_F^2 / min(n, m)
+        # Adaptive epsilon with exponential annealing:
+        # alpha(t) = max(epsilon_alpha, exp((t - 200) * ln(4) / 100))
+        # t < 200: alpha = epsilon_alpha (default 1.0)
+        # t = 200: alpha = 1.0
+        # t = 300: alpha = 4.0, continues growing exponentially
+        alpha_t = max(self.epsilon_alpha, math.exp((self._step_count) * math.log(4) / 100))
         fnorm_sq = W_f32.norm().square().clamp_min(1e-12)
-        eps = self.epsilon_alpha * fnorm_sq / min(n, m)
+        eps = alpha_t * fnorm_sq / min(n, m)
 
         # Batch CG: solve (WW^T + eps*I) Delta = Phi
         Delta = torch.zeros_like(Phi)
@@ -339,6 +347,7 @@ class GASD(torch.optim.Optimizer):
                     p.data.mul_(1 - lr * weight_decay)
                 p.data.add_(delta, alpha=-lr)
 
+        self._step_count += 1
         return loss
 
 
