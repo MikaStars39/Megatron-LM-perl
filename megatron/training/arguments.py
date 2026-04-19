@@ -2168,7 +2168,11 @@ def _add_regularization_args(parser):
                        dest='gasd_use_nesterov',
                        help='Disable Nesterov-style momentum for GASD')
     group.add_argument('--gasd-epsilon-alpha', type=float, default=1.0,
-                       help='Coefficient for adaptive epsilon: eps = alpha * ||W||_F^2 / min(n,m)')
+                       help='Initial/minimum coefficient for adaptive epsilon: eps = alpha(t) * ||W||_F^2 / min(n,m)')
+    group.add_argument('--gasd-epsilon-alpha-max', type=float, default=20.0,
+                       help='Maximum coefficient cap for epsilon annealing (0 = no cap)')
+    group.add_argument('--gasd-epsilon-alpha-rate', type=float, default=0.004,
+                       help='Exponential growth rate: alpha(t) = epsilon_alpha * exp(rate * step)')
     group.add_argument('--gasd-cg-iters', type=int, default=10,
                        help='Number of CG iterations for GASD')
     group.add_argument('--gasd-rms-scale', type=float, default=1.0,
