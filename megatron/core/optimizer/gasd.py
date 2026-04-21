@@ -18,10 +18,12 @@ the Three-Gate Theory observation that RLVR updates preferentially occur in
 off-principal subspaces.
 
 W is the current weight at each step (recomputed every step).
-eps is computed adaptively per layer: eps = alpha * ||W||_F^2 / min(n, m).
+eps is computed adaptively per layer: eps = alpha(t) * ||W||_F^2 / min(n, m),
+where alpha(t) can be annealed from epsilon_alpha to epsilon_alpha_final over training.
 """
 
 import logging
+import math
 from typing import Callable, Dict, List, Optional
 
 import torch
@@ -71,7 +73,9 @@ class GASD(torch.optim.Optimizer):
         momentum: Momentum coefficient (beta) for EMA.
         weight_decay: Decoupled weight decay coefficient.
         use_nesterov: Whether to use Nesterov-style momentum.
-        epsilon_alpha: Coefficient for adaptive epsilon: eps = alpha * ||W||_F^2 / min(n,m).
+        epsilon_alpha: Initial/minimum coefficient for adaptive epsilon: eps = alpha(t) * ||W||_F^2 / min(n,m).
+        epsilon_alpha_max: Maximum coefficient cap for epsilon annealing (0 = no cap).
+        epsilon_alpha_rate: Exponential growth rate: alpha(t) = epsilon_alpha * exp(rate * step).
         cg_iters: Number of Conjugate Gradient iterations (default 10).
         rms_scale: Scale factor after RMS normalization of the CG output (default 1.0).
         split_qkv: Whether to split QKV parameters.
@@ -94,6 +98,8 @@ class GASD(torch.optim.Optimizer):
         weight_decay: float = 0.01,
         use_nesterov: bool = True,
         epsilon_alpha: float = 1.0,
+        epsilon_alpha_max: float = 20.0,
+        epsilon_alpha_rate: float = 0.004,
         cg_iters: int = 10,
         rms_scale: float = 1.0,
         split_qkv: bool = False,
@@ -121,6 +127,8 @@ class GASD(torch.optim.Optimizer):
 
         self.use_nesterov = use_nesterov
         self.epsilon_alpha = epsilon_alpha
+        self.epsilon_alpha_max = epsilon_alpha_max
+        self.epsilon_alpha_rate = epsilon_alpha_rate
         self.cg_iters = cg_iters
         self.rms_scale = rms_scale
         self.split_qkv = split_qkv
@@ -133,6 +141,16 @@ class GASD(torch.optim.Optimizer):
         self.fp32_matmul_prec = fp32_matmul_prec
         self.tp_mode = tp_mode
         self.pg_collection = pg_collection
+        self._step_count = 0
+
+    def state_dict(self):
+        d = super().state_dict()
+        d['gasd_step_count'] = self._step_count
+        return d
+
+    def load_state_dict(self, state_dict):
+        self._step_count = state_dict.pop('gasd_step_count', 0)
+        super().load_state_dict(state_dict)
 
     def _get_tp_info(self, p: torch.Tensor):
         """Get TP group and partition dim for a parameter."""
@@ -205,9 +223,12 @@ class GASD(torch.optim.Optimizer):
         W_f32 = W.detach().float()
         n, m = W_f32.shape
 
-        # Adaptive epsilon: eps = alpha * ||W||_F^2 / min(n, m)
+        # Adaptive epsilon: alpha(t) = clamp(alpha_min * exp(rate * t), alpha_min, alpha_max)
+        alpha_t = self.epsilon_alpha * math.exp(self.epsilon_alpha_rate * self._step_count)
+        if self.epsilon_alpha_max > 0:
+            alpha_t = min(alpha_t, self.epsilon_alpha_max)
         fnorm_sq = W_f32.norm().square().clamp_min(1e-12)
-        eps = self.epsilon_alpha * fnorm_sq / min(n, m)
+        eps = alpha_t * fnorm_sq / min(n, m)
 
         # Batch CG: solve (WW^T + eps*I) Delta = Phi
         Delta = torch.zeros_like(Phi)
@@ -339,6 +360,7 @@ class GASD(torch.optim.Optimizer):
                     p.data.mul_(1 - lr * weight_decay)
                 p.data.add_(delta, alpha=-lr)
 
+        self._step_count += 1
         return loss
 
 
@@ -423,6 +445,8 @@ def get_megatron_gasd_optimizer(
         weight_decay=config.weight_decay,
         use_nesterov=config.gasd_use_nesterov,
         epsilon_alpha=config.gasd_epsilon_alpha,
+        epsilon_alpha_max=config.gasd_epsilon_alpha_max,
+        epsilon_alpha_rate=config.gasd_epsilon_alpha_rate,
         cg_iters=config.gasd_cg_iters,
         rms_scale=config.gasd_rms_scale,
         num_ns_steps=config.gasd_num_ns_steps,

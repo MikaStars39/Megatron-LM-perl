@@ -254,9 +254,14 @@ class OptimizerConfig:
     """Whether to use Nesterov-style momentum for GASD."""
 
     gasd_epsilon_alpha: float = 1.0
-    """Coefficient for adaptive epsilon: eps = alpha * ||W||_F^2 / min(n, m).
-    Controls the off-principal amplification strength. Larger = more SGD-like,
-    smaller = more aggressive off-principal amplification."""
+    """Initial/minimum coefficient for adaptive epsilon: eps = alpha(t) * ||W||_F^2 / min(n, m)."""
+
+    gasd_epsilon_alpha_max: float = 20.0
+    """Maximum coefficient cap for epsilon annealing. 0 = no cap."""
+
+    gasd_epsilon_alpha_rate: float = 0.004
+    """Exponential growth rate: alpha(t) = epsilon_alpha * exp(rate * step).
+    Clamped to [epsilon_alpha, epsilon_alpha_max]."""
 
     gasd_cg_iters: int = 10
     """Number of Conjugate Gradient iterations for solving (WW^T + eps*I) Delta = G."""
