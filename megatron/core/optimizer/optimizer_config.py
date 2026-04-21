@@ -130,6 +130,19 @@ class OptimizerConfig:
     sgd_momentum: float = 0.9
     """Momentum factor for SGD optimizer."""
 
+    # RMSprop.
+    rmsprop_alpha: float = 0.99
+    """Smoothing constant (decay rate) for RMSprop optimizer."""
+
+    rmsprop_eps: float = 1e-8
+    """Term added to the denominator to improve numerical stability in RMSprop optimizer."""
+
+    rmsprop_momentum: float = 0.0
+    """Momentum factor for RMSprop optimizer."""
+
+    rmsprop_centered: bool = False
+    """If true, compute the centered RMSprop (gradient normalized by its variance)."""
+
     # Muon
     muon_momentum: float = 0.95
     """The momentum used by the internal SGD."""
@@ -154,6 +167,165 @@ class OptimizerConfig:
 
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
+
+    # Roo (Matrix Natural Gradient)
+    roo_momentum: float = 0.95
+    """Momentum coefficient for Roo optimizer."""
+
+    roo_epsilon: float = 0.01
+    """Regularization epsilon for Roo inverse-spectral transform. Controls the crossover
+    point: singular values >> eps are damped (1/sigma), those << eps are amplified (sigma/eps^2)."""
+
+    roo_scale_factor: float = 1.0
+    """Scale factor applied after RMS normalization of the Roo update."""
+
+    roo_split_qkv: bool = True
+    """Whether to split QKV parameters for Roo optimizer."""
+
+    roo_tp_mode: str = "allreduce_gram"
+    """TP handling mode for Roo gram matrix computation.
+    'allreduce_gram': allreduce M^T M across TP ranks for row-parallel params.
+    'blockwise': treat each TP shard independently (no communication)."""
+
+    roo_num_ns_steps: int = 5
+    """Number of Newton-Schulz iteration steps for gram matrix inversion."""
+
+    roo_fp32_matmul_prec: str = "medium"
+    """FP32 matmul precision for Newton-Schulz iteration in Roo ('low', 'medium', 'high')."""
+
+    # RooNormal (SVD-based spectral clipping with Muon-style EMA)
+    roo_normal_momentum: float = 0.95
+    """Momentum coefficient (β) for RooNormal EMA: buf = β*buf + (1-β)*grad."""
+
+    roo_normal_clip_value: float = 20.0
+    """Singular value clipping threshold: f(σ) = min(1/(σ+ε), clip_value)."""
+
+    roo_normal_epsilon: float = 1e-7
+    """Small constant added before reciprocal to prevent division by zero."""
+
+    roo_normal_scale_factor: float = 1.0
+    """Scale factor applied after RMS normalization of the RooNormal update."""
+
+    roo_normal_use_nesterov: bool = True
+    """Whether to use Nesterov-style momentum (same as Muon default)."""
+
+    roo_normal_split_qkv: bool = True
+    """Whether to split QKV parameters for RooNormal optimizer."""
+
+    roo_normal_svd_log_interval: int = 10
+    """Log SVD singular value statistics every N steps. 0 disables logging."""
+
+    roo_normal_svd_log_dir: str = ""
+    """Directory to write SVD singular value logs. Empty string disables file logging."""
+
+    # MuonProjected (Muon with initial-weight projection)
+    muon_projected_momentum: float = 0.95
+    """Momentum coefficient (beta) for MuonProjected EMA."""
+
+    muon_projected_use_nesterov: bool = True
+    """Whether to use Nesterov-style momentum for MuonProjected."""
+
+    muon_projected_projection_alpha: float = 0.5
+    """Coefficient for the projection: (I - alpha * W0 @ W0^T)."""
+
+    muon_projected_split_qkv: bool = True
+    """Whether to split QKV parameters for MuonProjected optimizer."""
+
+    muon_projected_num_ns_steps: int = 5
+    """Number of Newton-Schulz iteration steps for Muon orthogonalization."""
+
+    muon_projected_scale_mode: str = "spectral"
+    """Scale mode for Muon update ('spectral', 'unit_rms_norm', 'shape_scaling')."""
+
+    muon_projected_extra_scale_factor: float = 1.0
+    """Additional scale factor for the Muon update."""
+
+    muon_projected_fp32_matmul_prec: str = "medium"
+    """FP32 matmul precision for NS iteration ('low', 'medium', 'high')."""
+
+    muon_projected_tp_mode: str = "blockwise"
+    """TP mode for Newton-Schulz and projection ('blockwise', 'duplicated', 'distributed')."""
+
+    # GASD (Geometry-Aware Steepest Descent)
+    gasd_momentum: float = 0.95
+    """Momentum coefficient (beta) for GASD EMA."""
+
+    gasd_use_nesterov: bool = True
+    """Whether to use Nesterov-style momentum for GASD."""
+
+    gasd_epsilon_alpha: float = 1.0
+    """Initial/minimum coefficient for adaptive epsilon: eps = alpha(t) * ||W||_F^2 / min(n, m)."""
+
+    gasd_epsilon_alpha_max: float = 20.0
+    """Maximum coefficient cap for epsilon annealing. 0 = no cap."""
+
+    gasd_epsilon_alpha_rate: float = 0.004
+    """Exponential growth rate: alpha(t) = epsilon_alpha * exp(rate * step).
+    Clamped to [epsilon_alpha, epsilon_alpha_max]."""
+
+    gasd_cg_iters: int = 10
+    """Number of Conjugate Gradient iterations for solving (WW^T + eps*I) Delta = G."""
+
+    gasd_rms_scale: float = 1.0
+    """Scale factor applied after RMS normalization of the CG output."""
+
+    gasd_split_qkv: bool = True
+    """Whether to split QKV parameters for GASD optimizer."""
+
+    gasd_num_ns_steps: int = 5
+    """Number of Newton-Schulz iteration steps for Muon orthogonalization in GASD."""
+
+    gasd_scale_mode: str = "spectral"
+    """Scale mode for Muon update in GASD ('spectral', 'unit_rms_norm', 'shape_scaling')."""
+
+    gasd_extra_scale_factor: float = 1.0
+    """Additional scale factor for the Muon update in GASD."""
+
+    gasd_fp32_matmul_prec: str = "medium"
+    """FP32 matmul precision for NS iteration in GASD ('low', 'medium', 'high')."""
+
+    gasd_tp_mode: str = "blockwise"
+    """TP mode for Newton-Schulz and GASD CG ('blockwise', 'duplicated', 'distributed')."""
+
+    # SOAP (ShampoO with Adam in the Preconditioner eigenbasis).
+    soap_beta1: float = 0.9
+    """First coefficient for inner Adam in SOAP optimizer."""
+
+    soap_beta2: float = 0.95
+    """Second coefficient for inner Adam in SOAP optimizer."""
+
+    soap_shampoo_beta: float = 0.95
+    """Beta for the Kronecker factor matrices moving average in SOAP optimizer."""
+
+    soap_eps: float = 1e-8
+    """Inner Adam epsilon for numerical stability in SOAP optimizer."""
+
+    soap_precondition_frequency: int = 1
+    """How often to update the preconditioner eigenbasis in SOAP optimizer."""
+
+    soap_adam_warmup_steps: int = 0
+    """Number of steps using plain Adam before enabling preconditioning in SOAP optimizer."""
+
+    soap_correct_bias: bool = True
+    """Whether to use bias correction in inner Adam and Kronecker factor EMA."""
+
+    soap_fp32_matmul_prec: str = "high"
+    """Precision of matmul operations in SOAP optimizer ('low', 'medium', 'high')."""
+
+    soap_use_eigh: bool = False
+    """Whether to use full symmetric eigendecomposition (eigh) to compute eigenbasis."""
+
+    soap_power_iter_steps: int = 1
+    """Number of power iteration steps before QR decomposition."""
+
+    soap_max_update_rms: float = 0.0
+    """Clip the update RMS to this value (0 means no clipping)."""
+
+    soap_nesterov: bool = False
+    """Whether to use Nesterov momentum in inner Adam."""
+
+    soap_split_qkv: bool = True
+    """Whether to split QKV parameters for SOAP optimizer."""
 
     #######################
     # Distributed optimizer

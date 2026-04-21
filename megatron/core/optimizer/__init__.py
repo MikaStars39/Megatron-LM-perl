@@ -378,6 +378,27 @@ def _get_megatron_optimizer_based_on_param_groups(
                 momentum=config.sgd_momentum,
             )
             init_state_fn = None
+        elif config.optimizer == 'rmsprop':
+            optimizer = torch.optim.RMSprop(
+                param_groups,
+                lr=config.lr,
+                alpha=config.rmsprop_alpha,
+                eps=config.rmsprop_eps,
+                weight_decay=config.weight_decay,
+                momentum=config.rmsprop_momentum,
+                centered=config.rmsprop_centered,
+            )
+
+            def init_state_fn(opt, config=None):
+                for group in opt.param_groups:
+                    for p in group['params']:
+                        if len(opt.state[p]) == 0:
+                            opt.state[p]['square_avg'] = torch.zeros_like(p.data)
+                            if config is not None and config.rmsprop_momentum > 0:
+                                opt.state[p]['momentum_buffer'] = torch.zeros_like(p.data)
+                            if config is not None and config.rmsprop_centered:
+                                opt.state[p]['grad_avg'] = torch.zeros_like(p.data)
+
         else:
             raise Exception('{} optimizer is not supported.'.format(config.optimizer))
     else:
