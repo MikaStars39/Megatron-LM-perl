@@ -73,9 +73,10 @@ class GASD(torch.optim.Optimizer):
         momentum: Momentum coefficient (beta) for EMA.
         weight_decay: Decoupled weight decay coefficient.
         use_nesterov: Whether to use Nesterov-style momentum.
-        epsilon_alpha: Initial/minimum coefficient for adaptive epsilon: eps = alpha(t) * ||W||_F^2 / min(n,m).
-        epsilon_alpha_max: Maximum coefficient cap for epsilon annealing (0 = no cap).
-        epsilon_alpha_rate: Exponential growth rate: alpha(t) = epsilon_alpha * exp(rate * step).
+        epsilon_alpha: Minimum coefficient for adaptive epsilon: eps = alpha(t) * ||W||_F^2 / min(n,m).
+        epsilon_alpha_max: Maximum coefficient for epsilon annealing.
+        epsilon_warmup_steps: Hold epsilon_alpha constant for this many steps.
+        epsilon_ramp_end_steps: Step at which alpha reaches epsilon_alpha_max. Linear ramp between warmup and this.
         cg_iters: Number of Conjugate Gradient iterations (default 10).
         rms_scale: Scale factor after RMS normalization of the CG output (default 1.0).
         split_qkv: Whether to split QKV parameters.
@@ -99,7 +100,8 @@ class GASD(torch.optim.Optimizer):
         use_nesterov: bool = True,
         epsilon_alpha: float = 1.0,
         epsilon_alpha_max: float = 20.0,
-        epsilon_alpha_rate: float = 0.004,
+        epsilon_warmup_steps: int = 50,
+        epsilon_ramp_end_steps: int = 800,
         cg_iters: int = 10,
         rms_scale: float = 1.0,
         split_qkv: bool = False,
@@ -128,7 +130,8 @@ class GASD(torch.optim.Optimizer):
         self.use_nesterov = use_nesterov
         self.epsilon_alpha = epsilon_alpha
         self.epsilon_alpha_max = epsilon_alpha_max
-        self.epsilon_alpha_rate = epsilon_alpha_rate
+        self.epsilon_warmup_steps = epsilon_warmup_steps
+        self.epsilon_ramp_end_steps = epsilon_ramp_end_steps
         self.cg_iters = cg_iters
         self.rms_scale = rms_scale
         self.split_qkv = split_qkv
@@ -223,10 +226,15 @@ class GASD(torch.optim.Optimizer):
         W_f32 = W.detach().float()
         n, m = W_f32.shape
 
-        # Adaptive epsilon: alpha(t) = clamp(alpha_min * exp(rate * t), alpha_min, alpha_max)
-        alpha_t = self.epsilon_alpha * math.exp(self.epsilon_alpha_rate * self._step_count)
-        if self.epsilon_alpha_max > 0:
-            alpha_t = min(alpha_t, self.epsilon_alpha_max)
+        # Three-stage epsilon: [0, warmup] = alpha_min, [warmup, ramp_end] = linear, [ramp_end, ∞] = alpha_max
+        step = self._step_count
+        if step <= self.epsilon_warmup_steps:
+            alpha_t = self.epsilon_alpha
+        elif step >= self.epsilon_ramp_end_steps:
+            alpha_t = self.epsilon_alpha_max
+        else:
+            t = (step - self.epsilon_warmup_steps) / (self.epsilon_ramp_end_steps - self.epsilon_warmup_steps)
+            alpha_t = self.epsilon_alpha + t * (self.epsilon_alpha_max - self.epsilon_alpha)
         fnorm_sq = W_f32.norm().square().clamp_min(1e-12)
         eps = alpha_t * fnorm_sq / min(n, m)
 
@@ -446,7 +454,8 @@ def get_megatron_gasd_optimizer(
         use_nesterov=config.gasd_use_nesterov,
         epsilon_alpha=config.gasd_epsilon_alpha,
         epsilon_alpha_max=config.gasd_epsilon_alpha_max,
-        epsilon_alpha_rate=config.gasd_epsilon_alpha_rate,
+        epsilon_warmup_steps=config.gasd_epsilon_warmup_steps,
+        epsilon_ramp_end_steps=config.gasd_epsilon_ramp_end_steps,
         cg_iters=config.gasd_cg_iters,
         rms_scale=config.gasd_rms_scale,
         num_ns_steps=config.gasd_num_ns_steps,
