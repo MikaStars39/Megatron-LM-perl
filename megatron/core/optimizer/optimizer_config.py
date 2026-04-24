@@ -268,6 +268,9 @@ class OptimizerConfig:
     gasd_cg_iters: int = 10
     """Number of Conjugate Gradient iterations for solving (WW^T + eps*I) Delta = G."""
 
+    gasd_cg_rtol: float = 1e-5
+    """Relative residual tolerance for CG early stopping. Set to 0 to disable."""
+
     gasd_rms_scale: float = 1.0
     """Scale factor applied after RMS normalization of the CG output."""
 

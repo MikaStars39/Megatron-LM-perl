@@ -77,7 +77,9 @@ class GASD(torch.optim.Optimizer):
         epsilon_alpha_max: Maximum coefficient for epsilon annealing.
         epsilon_warmup_steps: Hold epsilon_alpha constant for this many steps.
         epsilon_ramp_end_steps: Step at which alpha reaches epsilon_alpha_max. Linear ramp between warmup and this.
-        cg_iters: Number of Conjugate Gradient iterations (default 10).
+        cg_iters: Maximum number of Conjugate Gradient iterations (default 10).
+        cg_rtol: Relative residual tolerance for CG early stopping (default 1e-5).
+            CG terminates early when ||residual|| / ||rhs|| < cg_rtol. Set to 0 to disable.
         rms_scale: Scale factor after RMS normalization of the CG output (default 1.0).
         split_qkv: Whether to split QKV parameters.
         is_qkv_fn: Function to check if a parameter is QKV.
@@ -103,6 +105,7 @@ class GASD(torch.optim.Optimizer):
         epsilon_warmup_steps: int = 50,
         epsilon_ramp_end_steps: int = 800,
         cg_iters: int = 10,
+        cg_rtol: float = 1e-5,
         rms_scale: float = 1.0,
         split_qkv: bool = False,
         is_qkv_fn: Optional[Callable[[torch.Tensor], bool]] = None,
@@ -119,6 +122,8 @@ class GASD(torch.optim.Optimizer):
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
         if cg_iters < 1:
             raise ValueError(f"cg_iters must be at least 1, got {cg_iters}")
+        if cg_rtol < 0:
+            raise ValueError(f"cg_rtol must be non-negative, got {cg_rtol}")
 
         defaults = dict(
             lr=lr,
@@ -133,6 +138,7 @@ class GASD(torch.optim.Optimizer):
         self.epsilon_warmup_steps = epsilon_warmup_steps
         self.epsilon_ramp_end_steps = epsilon_ramp_end_steps
         self.cg_iters = cg_iters
+        self.cg_rtol = cg_rtol
         self.rms_scale = rms_scale
         self.split_qkv = split_qkv
         self.is_qkv_fn = is_qkv_fn
@@ -243,8 +249,10 @@ class GASD(torch.optim.Optimizer):
         R = Phi.clone()
         P = R.clone()
         rr = (R * R).sum()
+        rr_init = rr
+        cg_tol_sq = self.cg_rtol ** 2 * rr_init
 
-        for _ in range(self.cg_iters):
+        for cg_step in range(self.cg_iters):
             # A @ P = W @ (W^T @ P) + eps * P
             AP = W_f32 @ (W_f32.t() @ P) + eps * P
 
@@ -255,9 +263,25 @@ class GASD(torch.optim.Optimizer):
             R = R - alpha_cg * AP
 
             rr_new = (R * R).sum()
+
+            # Early stopping: relative residual ||r||/||b|| < cg_rtol
+            if rr_new < cg_tol_sq:
+                rr = rr_new
+                break
+
             beta_cg = rr_new / rr.clamp_min(1e-30)
             P = R + beta_cg * P
             rr = rr_new
+        else:
+            # CG did not converge — log warning
+            rel_residual = (rr / rr_init.clamp_min(1e-30)).sqrt().item()
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                f"GASD CG not converged: {self.cg_iters} iters, "
+                f"rel_residual={rel_residual:.2e}, rtol={self.cg_rtol:.1e}, "
+                f"shape={tuple(W_f32.shape)}, eps={eps.item():.2e}, step={self._step_count}",
+            )
 
         # RMS normalization: Delta = Delta / RMS(Delta) * scale
         rms = (Delta.square().mean()).sqrt().clamp_min(1e-12)
@@ -457,6 +481,7 @@ def get_megatron_gasd_optimizer(
         epsilon_warmup_steps=config.gasd_epsilon_warmup_steps,
         epsilon_ramp_end_steps=config.gasd_epsilon_ramp_end_steps,
         cg_iters=config.gasd_cg_iters,
+        cg_rtol=config.gasd_cg_rtol,
         rms_scale=config.gasd_rms_scale,
         num_ns_steps=config.gasd_num_ns_steps,
         scale_mode=config.gasd_scale_mode,

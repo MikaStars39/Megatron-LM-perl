@@ -2177,6 +2177,8 @@ def _add_regularization_args(parser):
                        help='Step at which epsilon reaches epsilon_alpha_max (linear ramp from warmup to here)')
     group.add_argument('--gasd-cg-iters', type=int, default=10,
                        help='Number of CG iterations for GASD')
+    group.add_argument('--gasd-cg-rtol', type=float, default=1e-5,
+                       help='Relative residual tolerance for CG early stopping. Set to 0 to disable.')
     group.add_argument('--gasd-rms-scale', type=float, default=1.0,
                        help='Scale factor after RMS normalization of GASD CG output')
     group.add_argument('--gasd-no-split-qkv', action='store_false', default=True,
