@@ -2179,6 +2179,13 @@ def _add_regularization_args(parser):
                        help='Number of CG iterations for GASD')
     group.add_argument('--gasd-cg-rtol', type=float, default=1e-5,
                        help='Relative residual tolerance for CG early stopping. Set to 0 to disable.')
+    group.add_argument('--gasd-cg-iters-min', type=int, default=None,
+                       help='Minimum CG iterations after decay. None=no decay, 0=decay to pure Muon.')
+    group.add_argument('--gasd-cg-decay-style', type=str, default='linear',
+                       choices=['linear', 'cosine'],
+                       help='CG iter decay style. Schedule follows epsilon warmup/ramp window.')
+    group.add_argument('--gasd-save-grad-dir', type=str, default=None,
+                       help='Directory to save raw gradients and momentum buffers at every step.')
     group.add_argument('--gasd-rms-scale', type=float, default=1.0,
                        help='Scale factor after RMS normalization of GASD CG output')
     group.add_argument('--gasd-no-split-qkv', action='store_false', default=True,

@@ -24,6 +24,7 @@ where alpha(t) can be annealed from epsilon_alpha to epsilon_alpha_final over tr
 
 import logging
 import math
+import os
 from typing import Callable, Dict, List, Optional
 
 import torch
@@ -80,6 +81,10 @@ class GASD(torch.optim.Optimizer):
         cg_iters: Maximum number of Conjugate Gradient iterations (default 10).
         cg_rtol: Relative residual tolerance for CG early stopping (default 1e-5).
             CG terminates early when ||residual|| / ||rhs|| < cg_rtol. Set to 0 to disable.
+        cg_iters_min: Minimum CG iterations after decay. None = no decay. 0 = decay to pure Muon.
+            When set, CG iters decay from cg_iters to cg_iters_min following the epsilon
+            warmup/ramp schedule. Output is blended: w*GASD + (1-w)*Muon where w=cg_iters_t/cg_iters.
+        cg_decay_style: Decay style for CG iters: 'linear' or 'cosine'.
         rms_scale: Scale factor after RMS normalization of the CG output (default 1.0).
         split_qkv: Whether to split QKV parameters.
         is_qkv_fn: Function to check if a parameter is QKV.
@@ -106,6 +111,8 @@ class GASD(torch.optim.Optimizer):
         epsilon_ramp_end_steps: int = 800,
         cg_iters: int = 10,
         cg_rtol: float = 1e-5,
+        cg_iters_min: Optional[int] = None,
+        cg_decay_style: str = "linear",
         rms_scale: float = 1.0,
         split_qkv: bool = False,
         is_qkv_fn: Optional[Callable[[torch.Tensor], bool]] = None,
@@ -117,6 +124,8 @@ class GASD(torch.optim.Optimizer):
         fp32_matmul_prec: str = "medium",
         tp_mode: str = "blockwise",
         pg_collection: Optional[ProcessGroupCollection] = None,
+        save_grad_dir: Optional[str] = None,
+        param_names: Optional[Dict[int, str]] = None,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
@@ -124,6 +133,10 @@ class GASD(torch.optim.Optimizer):
             raise ValueError(f"cg_iters must be at least 1, got {cg_iters}")
         if cg_rtol < 0:
             raise ValueError(f"cg_rtol must be non-negative, got {cg_rtol}")
+        if cg_iters_min is not None and not (0 <= cg_iters_min <= cg_iters):
+            raise ValueError(
+                f"cg_iters_min must be in [0, cg_iters={cg_iters}], got {cg_iters_min}"
+            )
 
         defaults = dict(
             lr=lr,
@@ -139,6 +152,8 @@ class GASD(torch.optim.Optimizer):
         self.epsilon_ramp_end_steps = epsilon_ramp_end_steps
         self.cg_iters = cg_iters
         self.cg_rtol = cg_rtol
+        self.cg_iters_min = cg_iters_min
+        self.cg_decay_style = cg_decay_style
         self.rms_scale = rms_scale
         self.split_qkv = split_qkv
         self.is_qkv_fn = is_qkv_fn
@@ -151,6 +166,10 @@ class GASD(torch.optim.Optimizer):
         self.tp_mode = tp_mode
         self.pg_collection = pg_collection
         self._step_count = 0
+        self.save_grad_dir = save_grad_dir
+        self.param_names = param_names or {}
+        if save_grad_dir and torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            os.makedirs(save_grad_dir, exist_ok=True)
 
     def state_dict(self):
         d = super().state_dict()
@@ -160,6 +179,30 @@ class GASD(torch.optim.Optimizer):
     def load_state_dict(self, state_dict):
         self._step_count = state_dict.pop('gasd_step_count', 0)
         super().load_state_dict(state_dict)
+
+    def _save_grads(self):
+        """Save raw gradients and momentum buffers to disk (rank 0 only)."""
+        if not self.save_grad_dir:
+            return
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
+
+        data = {}
+        idx = 0
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                name = self.param_names.get(id(p), f"param_{idx}")
+                entry = {'grad': p.grad.detach().bfloat16().cpu()}
+                state = self.state.get(p, {})
+                if 'momentum_buffer' in state:
+                    entry['momentum_buffer'] = state['momentum_buffer'].detach().bfloat16().cpu()
+                data[name] = entry
+                idx += 1
+
+        path = os.path.join(self.save_grad_dir, f"step_{self._step_count}.pt")
+        torch.save(data, path)
 
     def _get_tp_info(self, p: torch.Tensor):
         """Get TP group and partition dim for a parameter."""
@@ -220,13 +263,43 @@ class GASD(torch.optim.Optimizer):
         torch.set_float32_matmul_precision(orig_prec)
         return result.to(orig_dtype)
 
+    def _get_cg_iters(self) -> int:
+        """Compute current CG iteration count based on decay schedule.
+
+        Reuses epsilon warmup/ramp window. Returns self.cg_iters when no decay.
+        """
+        if self.cg_iters_min is None or self.cg_iters_min >= self.cg_iters:
+            return self.cg_iters
+        step = self._step_count
+        if step <= self.epsilon_warmup_steps:
+            return self.cg_iters
+        if step >= self.epsilon_ramp_end_steps:
+            return self.cg_iters_min
+        t = (step - self.epsilon_warmup_steps) / (
+            self.epsilon_ramp_end_steps - self.epsilon_warmup_steps
+        )
+        if self.cg_decay_style == "cosine":
+            t = (1 - math.cos(math.pi * t)) / 2
+        cg_float = self.cg_iters * (1 - t) + self.cg_iters_min * t
+        return max(self.cg_iters_min, round(cg_float))
+
     def _apply_gasd(self, muon_update: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
         """Solve (WW^T + eps*I) Delta = Phi via batch Conjugate Gradient.
 
         Avoids forming the [n, n] matrix WW^T explicitly. Each CG iteration
         only requires two matmuls: v = W^T @ P, then AP = W @ v + eps * P.
         W is the current weight (recomputed every step).
+
+        When CG iter decay is enabled, blends the RMS-normalized CG output with
+        the raw Muon output (Phi) using w = cg_iters_t / cg_iters. This smoothly
+        transitions from GASD (w=1, RMS-normed) to pure Muon (w=0, natural scale).
         """
+        cg_iters_t = self._get_cg_iters()
+
+        # Pure Muon: skip CG entirely, preserve Muon's natural scale (e.g. 0.2)
+        if cg_iters_t == 0:
+            return muon_update
+
         orig_dtype = muon_update.dtype
         Phi = muon_update.float()
         W_f32 = W.detach().float()
@@ -252,7 +325,7 @@ class GASD(torch.optim.Optimizer):
         rr_init = rr
         cg_tol_sq = self.cg_rtol ** 2 * rr_init
 
-        for cg_step in range(self.cg_iters):
+        for cg_step in range(cg_iters_t):
             # A @ P = W @ (W^T @ P) + eps * P
             AP = W_f32 @ (W_f32.t() @ P) + eps * P
 
@@ -278,7 +351,7 @@ class GASD(torch.optim.Optimizer):
             log_single_rank(
                 logger,
                 logging.WARNING,
-                f"GASD CG not converged: {self.cg_iters} iters, "
+                f"GASD CG not converged: {cg_iters_t} iters, "
                 f"rel_residual={rel_residual:.2e}, rtol={self.cg_rtol:.1e}, "
                 f"shape={tuple(W_f32.shape)}, eps={eps.item():.2e}, step={self._step_count}",
             )
@@ -286,6 +359,12 @@ class GASD(torch.optim.Optimizer):
         # RMS normalization: Delta = Delta / RMS(Delta) * scale
         rms = (Delta.square().mean()).sqrt().clamp_min(1e-12)
         Delta = Delta / rms * self.rms_scale
+
+        # Blend GASD and Muon outputs for smooth scale transition
+        # w=1.0: full GASD (RMS-normed), w=0.0: pure Muon (natural scale)
+        if self.cg_iters_min is not None and cg_iters_t < self.cg_iters:
+            w = cg_iters_t / self.cg_iters
+            Delta = w * Delta + (1 - w) * Phi
 
         return Delta.to(orig_dtype)
 
@@ -343,6 +422,9 @@ class GASD(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        # Save raw gradients and momentum before they are consumed
+        self._save_grads()
 
         for group in self.param_groups:
             momentum_beta = group['momentum']
@@ -464,6 +546,13 @@ def get_megatron_gasd_optimizer(
             else:
                 nonlinear_params.append(param)
 
+    # Build param id → name mapping for grad saving
+    param_names = {}
+    for model_chunk in model_chunks:
+        for name, param in model_chunk.named_parameters():
+            if param.requires_grad and id(param) not in param_names:
+                param_names[id(param)] = name
+
     # === GASD optimizer for linear params ===
     for param in nonlinear_params:
         param.requires_grad = False
@@ -482,6 +571,8 @@ def get_megatron_gasd_optimizer(
         epsilon_ramp_end_steps=config.gasd_epsilon_ramp_end_steps,
         cg_iters=config.gasd_cg_iters,
         cg_rtol=config.gasd_cg_rtol,
+        cg_iters_min=config.gasd_cg_iters_min,
+        cg_decay_style=config.gasd_cg_decay_style,
         rms_scale=config.gasd_rms_scale,
         num_ns_steps=config.gasd_num_ns_steps,
         scale_mode=config.gasd_scale_mode,
@@ -492,6 +583,8 @@ def get_megatron_gasd_optimizer(
         is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
         qkv_split_shapes=qkv_split_shapes,
         pg_collection=pg_collection,
+        save_grad_dir=config.gasd_save_grad_dir,
+        param_names=param_names,
     )
 
     def gasd_init_state_fn(opt, config=None):

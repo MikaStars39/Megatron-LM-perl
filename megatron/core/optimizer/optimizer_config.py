@@ -271,6 +271,15 @@ class OptimizerConfig:
     gasd_cg_rtol: float = 1e-5
     """Relative residual tolerance for CG early stopping. Set to 0 to disable."""
 
+    gasd_cg_iters_min: Optional[int] = None
+    """Minimum CG iterations after decay. None = no decay (backward compatible). 0 = decay to pure Muon."""
+
+    gasd_cg_decay_style: str = "linear"
+    """CG iter decay style: 'linear' or 'cosine'. Schedule follows epsilon warmup/ramp window."""
+
+    gasd_save_grad_dir: Optional[str] = None
+    """Directory to save raw gradients and momentum buffers at every step. None = disabled."""
+
     gasd_rms_scale: float = 1.0
     """Scale factor applied after RMS normalization of the CG output."""
 
