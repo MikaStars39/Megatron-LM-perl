@@ -321,7 +321,7 @@ class GASD(torch.optim.Optimizer):
                 logging.WARNING,
                 f"GASD CG not converged: {cg_iters_t} iters, "
                 f"rel_residual={rel_residual:.2e}, rtol={self.cg_rtol:.1e}, "
-                f"shape={tuple(W_f32.shape)}, eps={eps.item():.2e}, step={self._step_count}",
+                f"shape={tuple(W_f32.shape)}, eps={eps:.2e}, step={self._step_count}",
             )
 
         # RMS normalization: Delta = Delta / RMS(Delta) * scale
