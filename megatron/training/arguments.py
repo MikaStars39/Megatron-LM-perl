@@ -2169,7 +2169,7 @@ def _add_regularization_args(parser):
                        help='Disable Nesterov-style momentum for GASD')
     group.add_argument('--gasd-epsilon-alpha', type=float, default=1.0,
                        help='Minimum coefficient for adaptive epsilon: eps = alpha(t) * ||W||_F^2 / min(n,m)')
-    group.add_argument('--gasd-epsilon-alpha-max', type=float, default=20.0,
+    group.add_argument('--gasd-epsilon-alpha-max', type=float, default=1.0,
                        help='Maximum coefficient for epsilon annealing')
     group.add_argument('--gasd-epsilon-warmup-steps', type=int, default=50,
                        help='Hold epsilon at epsilon_alpha for this many initial steps')
@@ -2184,8 +2184,6 @@ def _add_regularization_args(parser):
     group.add_argument('--gasd-cg-decay-style', type=str, default='linear',
                        choices=['linear', 'cosine'],
                        help='CG iter decay style. Schedule follows epsilon warmup/ramp window.')
-    group.add_argument('--gasd-save-grad-dir', type=str, default=None,
-                       help='Directory to save raw gradients and momentum buffers at every step.')
     group.add_argument('--gasd-rms-scale', type=float, default=1.0,
                        help='Scale factor after RMS normalization of GASD CG output')
     group.add_argument('--gasd-no-split-qkv', action='store_false', default=True,

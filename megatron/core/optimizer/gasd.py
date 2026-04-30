@@ -24,7 +24,6 @@ where alpha(t) can be annealed from epsilon_alpha to epsilon_alpha_final over tr
 
 import logging
 import math
-import os
 from typing import Callable, Dict, List, Optional
 
 import torch
@@ -106,7 +105,7 @@ class GASD(torch.optim.Optimizer):
         weight_decay: float = 0.01,
         use_nesterov: bool = True,
         epsilon_alpha: float = 1.0,
-        epsilon_alpha_max: float = 20.0,
+        epsilon_alpha_max: float = 1.0,
         epsilon_warmup_steps: int = 50,
         epsilon_ramp_end_steps: int = 800,
         cg_iters: int = 10,
@@ -124,8 +123,6 @@ class GASD(torch.optim.Optimizer):
         fp32_matmul_prec: str = "medium",
         tp_mode: str = "blockwise",
         pg_collection: Optional[ProcessGroupCollection] = None,
-        save_grad_dir: Optional[str] = None,
-        param_names: Optional[Dict[int, str]] = None,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
@@ -166,10 +163,6 @@ class GASD(torch.optim.Optimizer):
         self.tp_mode = tp_mode
         self.pg_collection = pg_collection
         self._step_count = 0
-        self.save_grad_dir = save_grad_dir
-        self.param_names = param_names or {}
-        if save_grad_dir and torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
-            os.makedirs(save_grad_dir, exist_ok=True)
 
     def state_dict(self):
         d = super().state_dict()
@@ -179,30 +172,6 @@ class GASD(torch.optim.Optimizer):
     def load_state_dict(self, state_dict):
         self._step_count = state_dict.pop('gasd_step_count', 0)
         super().load_state_dict(state_dict)
-
-    def _save_grads(self):
-        """Save raw gradients and momentum buffers to disk (rank 0 only)."""
-        if not self.save_grad_dir:
-            return
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
-            return
-
-        data = {}
-        idx = 0
-        for group in self.param_groups:
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                name = self.param_names.get(id(p), f"param_{idx}")
-                entry = {'grad': p.grad.detach().bfloat16().cpu()}
-                state = self.state.get(p, {})
-                if 'momentum_buffer' in state:
-                    entry['momentum_buffer'] = state['momentum_buffer'].detach().bfloat16().cpu()
-                data[name] = entry
-                idx += 1
-
-        path = os.path.join(self.save_grad_dir, f"step_{self._step_count}.pt")
-        torch.save(data, path)
 
     def _get_tp_info(self, p: torch.Tensor):
         """Get TP group and partition dim for a parameter."""
@@ -422,8 +391,6 @@ class GASD(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        # Save raw gradients and momentum before they are consumed
-        self._save_grads()
 
         for group in self.param_groups:
             momentum_beta = group['momentum']
@@ -545,13 +512,6 @@ def get_megatron_gasd_optimizer(
             else:
                 nonlinear_params.append(param)
 
-    # Build param id → name mapping for grad saving
-    param_names = {}
-    for model_chunk in model_chunks:
-        for name, param in model_chunk.named_parameters():
-            if param.requires_grad and id(param) not in param_names:
-                param_names[id(param)] = name
-
     # === GASD optimizer for linear params ===
     for param in nonlinear_params:
         param.requires_grad = False
@@ -582,8 +542,6 @@ def get_megatron_gasd_optimizer(
         is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
         qkv_split_shapes=qkv_split_shapes,
         pg_collection=pg_collection,
-        save_grad_dir=config.gasd_save_grad_dir,
-        param_names=param_names,
     )
 
     def gasd_init_state_fn(opt, config=None):

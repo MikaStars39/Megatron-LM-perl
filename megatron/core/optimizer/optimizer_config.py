@@ -256,7 +256,7 @@ class OptimizerConfig:
     gasd_epsilon_alpha: float = 1.0
     """Minimum coefficient for adaptive epsilon: eps = alpha(t) * ||W||_F^2 / min(n, m)."""
 
-    gasd_epsilon_alpha_max: float = 20.0
+    gasd_epsilon_alpha_max: float = 1.0
     """Maximum coefficient for epsilon annealing."""
 
     gasd_epsilon_warmup_steps: int = 50
@@ -276,9 +276,6 @@ class OptimizerConfig:
 
     gasd_cg_decay_style: str = "linear"
     """CG iter decay style: 'linear' or 'cosine'. Schedule follows epsilon warmup/ramp window."""
-
-    gasd_save_grad_dir: Optional[str] = None
-    """Directory to save raw gradients and momentum buffers at every step. None = disabled."""
 
     gasd_rms_scale: float = 1.0
     """Scale factor applied after RMS normalization of the CG output."""
