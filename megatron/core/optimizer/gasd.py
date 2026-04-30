@@ -314,8 +314,7 @@ class GASD(torch.optim.Optimizer):
         else:
             t = (step - self.epsilon_warmup_steps) / (self.epsilon_ramp_end_steps - self.epsilon_warmup_steps)
             alpha_t = self.epsilon_alpha + t * (self.epsilon_alpha_max - self.epsilon_alpha)
-        fnorm_sq = W_f32.norm().square().clamp_min(1e-12)
-        eps = alpha_t * fnorm_sq / min(n, m)
+        eps = alpha_t
 
         # Batch CG: solve (WW^T + eps*I) Delta = Phi
         Delta = torch.zeros_like(Phi)
