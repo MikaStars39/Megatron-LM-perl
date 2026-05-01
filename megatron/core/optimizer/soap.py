@@ -9,6 +9,7 @@ Megatron integration wrapper that splits parameters into:
 Uses the SOAP implementation from emerging_optimizers.
 """
 
+import copy
 import logging
 from itertools import chain
 from typing import Dict, List, Optional
@@ -253,8 +254,6 @@ def get_megatron_soap_optimizer(
     3. Freeze linear -> create Adam for nonlinear
     4. Unfreeze all -> return ChainedOptimizer
     """
-    config.optimizer = 'adam'
-
     assert HAVE_SOAP, (
         "SOAP optimizer requires 'emerging_optimizers' package. "
         "Install from: https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.1.0"
@@ -315,8 +314,8 @@ def get_megatron_soap_optimizer(
             for p in group['params']:
                 if len(opt.state[p]) == 0:
                     opt.state[p]['step'] = 0
-                    opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
-                    opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
+                    opt.state[p]['exp_avg'] = torch.zeros_like(p.data, dtype=torch.float32)
+                    opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data, dtype=torch.float32)
                     # Preconditioner matrices (square, shape != param shape)
                     opt.state[p]['L'] = torch.zeros(p.shape[0], p.shape[0], device=p.device)
                     opt.state[p]['R'] = torch.zeros(p.shape[1], p.shape[1], device=p.device)
@@ -343,8 +342,10 @@ def get_megatron_soap_optimizer(
     for param in linear_params:
         param.requires_grad = False
 
+    adam_config = copy.copy(config)
+    adam_config.optimizer = 'adam'
     chained_adam = get_megatron_optimizer(
-        config,
+        adam_config,
         model_chunks,
         config_overrides=config_overrides,
         use_gloo_process_groups=use_gloo_process_groups,
