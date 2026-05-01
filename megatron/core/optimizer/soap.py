@@ -15,7 +15,12 @@ from typing import Dict, List, Optional
 
 import torch
 
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core import parallel_state
+from megatron.core.dist_checkpointing.mapping import (
+    ShardedStateDict,
+    ShardedTensor as MappingShardedTensor,
+    ShardedTensorFactory,
+)
 from megatron.core.dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
     make_sharded_optimizer_tensor,
@@ -47,6 +52,58 @@ logger = logging.getLogger(__name__)
 _SOAP_PRECOND_KEYS = ('L', 'R', 'Q_L', 'Q_R')
 
 
+def _make_precond_sharded_tensor(precond_key, precond_data, model_sharded_param):
+    """Build a ShardedTensor for a SOAP preconditioner matrix.
+
+    All preconditioners are saved as block-diagonal shards across TP ranks.
+    Each TP rank's preconditioner is computed from local gradients and has
+    unique values, so none can be treated as replicated.
+
+    L/R use allow_shape_mismatch=True because zero-init is correct on
+    shape mismatch (matches init_kronecker_factors).  Q_L/Q_R use False
+    because they require identity init; on TP reshard the user should
+    use --no-load-optim to skip optimizer state.
+
+    Args:
+        precond_key: one of 'L', 'R', 'Q_L', 'Q_R'
+        precond_data: the local preconditioner tensor [dim, dim]
+        model_sharded_param: ShardedTensor or ShardedTensorFactory from model
+    """
+    if isinstance(model_sharded_param, ShardedTensorFactory):
+        # ShardedTensorFactory occurs for vocab-parallel embeddings, but those
+        # have is_embedding_or_output_parameter=True and go to nonlinear_params
+        # (Adam), not SOAP.  If we ever reach here, fall back to plain tensor.
+        return precond_data
+
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+    dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+    tp_rank = torch.distributed.get_rank(tp_group)
+    tp_size = torch.distributed.get_world_size(tp_group)
+    dp_rank = torch.distributed.get_rank(dp_cp_group)
+
+    key = f'optimizer.state.{precond_key}.{model_sharded_param.key}'
+    allow_mismatch = precond_key in ('L', 'R')
+
+    if tp_size == 1:
+        return MappingShardedTensor.from_rank_offsets(
+            key,
+            precond_data,
+            replica_id=(0, 0, dp_rank),
+            allow_shape_mismatch=allow_mismatch,
+        )
+
+    # TP > 1: block-diagonal sharding — each rank's [dim, dim] is a
+    # separate block in a virtual [dim*tp, dim*tp] global tensor.
+    return MappingShardedTensor.from_rank_offsets(
+        key,
+        precond_data,
+        (0, tp_rank, tp_size),
+        (1, tp_rank, tp_size),
+        replica_id=(0, 0, dp_rank),
+        allow_shape_mismatch=allow_mismatch,
+    )
+
+
 class SoapFloat16Optimizer(Float16OptimizerWithFloat16Params):
     """Float16 wrapper that handles SOAP preconditioner checkpoint correctly.
 
@@ -56,8 +113,7 @@ class SoapFloat16Optimizer(Float16OptimizerWithFloat16Params):
     shape as the parameter, which triggers an assertion error.
 
     This subclass excludes those keys from the normal sharded path and saves
-    them as plain (non-sharded, per-rank replicated) tensors instead.
-    """
+    them as properly sharded tensors with block-diagonal TP sharding."""
 
     def sharded_state_dict(
         self,
@@ -107,14 +163,79 @@ class SoapFloat16Optimizer(Float16OptimizerWithFloat16Params):
             state_dict['optimizer'], id_to_sharded_param_map, exclude_keys="step"
         )
 
-        # Put preconditioner tensors back as plain (non-sharded) tensors.
-        # They will be saved/loaded per-rank without sharding metadata.
+        # Put preconditioner tensors back as ShardedTensors with per-rank
+        # block-diagonal sharding so each TP/PP rank saves its own copy.
         for param_id, precond in precond_states.items():
-            for key, tensor in precond.items():
-                state_dict['optimizer']['state'][param_id][key] = tensor
+            if param_id not in id_to_sharded_param_map:
+                # Fallback: save as plain tensor (shouldn't happen in normal flow)
+                for key, tensor in precond.items():
+                    state_dict['optimizer']['state'][param_id][key] = tensor
+                continue
+            model_sh_param = id_to_sharded_param_map[param_id]
+            for precond_key, precond_tensor in precond.items():
+                state_dict['optimizer']['state'][param_id][precond_key] = (
+                    _make_precond_sharded_tensor(
+                        precond_key, precond_tensor, model_sh_param
+                    )
+                )
 
         if step:
             state_dict['optimizer']['state']['common_step'] = step
+        return state_dict
+
+
+class SoapFP32Optimizer(FP32Optimizer):
+    """FP32 wrapper that handles SOAP preconditioner checkpoint correctly.
+
+    Same as SoapFloat16Optimizer but adapted for FP32Optimizer's state dict
+    layout where state lives at state_dict['state'] instead of
+    state_dict['optimizer']['state']."""
+
+    def sharded_state_dict(
+        self,
+        model_sharded_state_dict: ShardedStateDict,
+        is_loading: bool = False,
+        metadata: Optional[dict] = None,
+    ):
+        if is_loading:
+            self.init_state_fn(self.optimizer, self.config)
+
+        state_dict = self.state_dict()
+        id_to_sharded_param_map = get_param_id_to_sharded_param_map(
+            model_sharded_state_dict, self.get_parameters()
+        )
+        step = self._extract_common_per_param_step(state_dict)
+
+        # --- SOAP-specific: pull preconditioner tensors out before sharding ---
+        precond_states = {}
+        for param_id, param_state in state_dict['state'].items():
+            precond_states[param_id] = {}
+            for key in _SOAP_PRECOND_KEYS:
+                if key in param_state:
+                    precond_states[param_id][key] = param_state.pop(key)
+
+        # Shard the remaining Adam-compatible state (exp_avg, exp_avg_sq)
+        optim_state_to_sharding_state(
+            state_dict, id_to_sharded_param_map, exclude_keys="step"
+        )
+
+        # Put preconditioner tensors back as ShardedTensors with per-rank
+        # block-diagonal sharding so each TP/PP rank saves its own copy.
+        for param_id, precond in precond_states.items():
+            if param_id not in id_to_sharded_param_map:
+                for key, tensor in precond.items():
+                    state_dict['state'][param_id][key] = tensor
+                continue
+            model_sh_param = id_to_sharded_param_map[param_id]
+            for precond_key, precond_tensor in precond.items():
+                state_dict['state'][param_id][precond_key] = (
+                    _make_precond_sharded_tensor(
+                        precond_key, precond_tensor, model_sh_param
+                    )
+                )
+
+        if step:
+            state_dict['state']['common_step'] = step
         return state_dict
 
 
@@ -193,7 +314,7 @@ def get_megatron_soap_optimizer(
         for group in opt.param_groups:
             for p in group['params']:
                 if len(opt.state[p]) == 0:
-                    opt.state[p]['step'] = torch.tensor(0.0)
+                    opt.state[p]['step'] = 0
                     opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
                     opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
                     # Preconditioner matrices (square, shape != param shape)
@@ -210,7 +331,7 @@ def get_megatron_soap_optimizer(
             soap_optimizer, config, None, soap_init_state_fn
         )
     else:
-        soap_wrapped = FP32Optimizer(
+        soap_wrapped = SoapFP32Optimizer(
             soap_optimizer, config, soap_init_state_fn
         )
 
