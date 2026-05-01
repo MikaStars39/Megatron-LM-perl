@@ -55,7 +55,11 @@ _SOAP_PRECOND_KEYS = ('L', 'R', 'Q_L', 'Q_R')
 def _make_precond_sharded_tensor(precond_key, precond_data, model_sharded_param):
     """Build a ShardedTensor for a SOAP preconditioner matrix.
 
-    All preconditioners are saved as block-diagonal shards across TP ranks.
+    All preconditioners are saved with 1D stacking across TP ranks along axis 0.
+    Each TP rank's [dim, dim] preconditioner is stacked into a virtual
+    [dim*tp, dim] global tensor.  This ensures every chunk of the global tensor
+    is covered (required by validate_sharding_integrity).
+
     Each TP rank's preconditioner is computed from local gradients and has
     unique values, so none can be treated as replicated.
 
@@ -92,13 +96,12 @@ def _make_precond_sharded_tensor(precond_key, precond_data, model_sharded_param)
             allow_shape_mismatch=allow_mismatch,
         )
 
-    # TP > 1: block-diagonal sharding — each rank's [dim, dim] is a
-    # separate block in a virtual [dim*tp, dim*tp] global tensor.
+    # TP > 1: stack each rank's [dim, dim] along axis 0 into a
+    # [dim*tp, dim] global tensor.  Each rank owns one [dim, dim] slice.
     return MappingShardedTensor.from_rank_offsets(
         key,
         precond_data,
         (0, tp_rank, tp_size),
-        (1, tp_rank, tp_size),
         replica_id=(0, 0, dp_rank),
         allow_shape_mismatch=allow_mismatch,
     )
