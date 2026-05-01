@@ -804,7 +804,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         metadata: Optional[dict] = None,
     ):
 
-        if is_loading:
+        if is_loading and self.init_state_fn is not None:
             self.init_state_fn(self.optimizer, self.config)
 
         state_dict = self.state_dict()
@@ -1015,7 +1015,7 @@ class FP32Optimizer(MegatronOptimizer):
         is_loading: bool = False,
         metadata: Optional[dict] = None,
     ):
-        if is_loading:
+        if is_loading and self.init_state_fn is not None:
             self.init_state_fn(self.optimizer, self.config)
 
         state_dict = self.state_dict()
