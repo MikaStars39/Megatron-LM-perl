@@ -9,7 +9,6 @@ Megatron integration wrapper that splits parameters into:
 Uses the SOAP implementation from emerging_optimizers.
 """
 
-import copy
 import logging
 from itertools import chain
 from typing import Dict, List, Optional
@@ -342,14 +341,17 @@ def get_megatron_soap_optimizer(
     for param in linear_params:
         param.requires_grad = False
 
-    adam_config = copy.copy(config)
-    adam_config.optimizer = 'adam'
+    # Temporarily set optimizer to 'adam' so get_megatron_optimizer creates
+    # an Adam optimizer, then restore to avoid permanent config mutation.
+    orig_optimizer = config.optimizer
+    config.optimizer = 'adam'
     chained_adam = get_megatron_optimizer(
-        adam_config,
+        config,
         model_chunks,
         config_overrides=config_overrides,
         use_gloo_process_groups=use_gloo_process_groups,
     )
+    config.optimizer = orig_optimizer
 
     for param in linear_params:
         param.requires_grad = True
