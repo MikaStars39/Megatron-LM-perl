@@ -2168,13 +2168,22 @@ def _add_regularization_args(parser):
                        dest='gasd_use_nesterov',
                        help='Disable Nesterov-style momentum for GASD')
     group.add_argument('--gasd-epsilon-alpha', type=float, default=1.0,
-                       help='Initial/minimum coefficient for adaptive epsilon: eps = alpha(t) * ||W||_F^2 / min(n,m)')
-    group.add_argument('--gasd-epsilon-alpha-max', type=float, default=20.0,
-                       help='Maximum coefficient cap for epsilon annealing (0 = no cap)')
-    group.add_argument('--gasd-epsilon-alpha-rate', type=float, default=0.004,
-                       help='Exponential growth rate: alpha(t) = epsilon_alpha * exp(rate * step)')
+                       help='Minimum coefficient for adaptive epsilon: eps = alpha(t) * ||W||_F^2 / min(n,m)')
+    group.add_argument('--gasd-epsilon-alpha-max', type=float, default=1.0,
+                       help='Maximum coefficient for epsilon annealing')
+    group.add_argument('--gasd-epsilon-warmup-steps', type=int, default=50,
+                       help='Hold epsilon at epsilon_alpha for this many initial steps')
+    group.add_argument('--gasd-epsilon-ramp-end-steps', type=int, default=800,
+                       help='Step at which epsilon reaches epsilon_alpha_max (linear ramp from warmup to here)')
     group.add_argument('--gasd-cg-iters', type=int, default=10,
                        help='Number of CG iterations for GASD')
+    group.add_argument('--gasd-cg-rtol', type=float, default=1e-5,
+                       help='Relative residual tolerance for CG early stopping. Set to 0 to disable.')
+    group.add_argument('--gasd-cg-iters-min', type=int, default=None,
+                       help='Minimum CG iterations after decay. None=no decay, 0=decay to pure Muon.')
+    group.add_argument('--gasd-cg-decay-style', type=str, default='linear',
+                       choices=['linear', 'cosine'],
+                       help='CG iter decay style. Schedule follows epsilon warmup/ramp window.')
     group.add_argument('--gasd-rms-scale', type=float, default=1.0,
                        help='Scale factor after RMS normalization of GASD CG output')
     group.add_argument('--gasd-no-split-qkv', action='store_false', default=True,

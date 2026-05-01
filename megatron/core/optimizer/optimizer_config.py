@@ -254,17 +254,28 @@ class OptimizerConfig:
     """Whether to use Nesterov-style momentum for GASD."""
 
     gasd_epsilon_alpha: float = 1.0
-    """Initial/minimum coefficient for adaptive epsilon: eps = alpha(t) * ||W||_F^2 / min(n, m)."""
+    """Minimum coefficient for adaptive epsilon: eps = alpha(t) * ||W||_F^2 / min(n, m)."""
 
-    gasd_epsilon_alpha_max: float = 20.0
-    """Maximum coefficient cap for epsilon annealing. 0 = no cap."""
+    gasd_epsilon_alpha_max: float = 1.0
+    """Maximum coefficient for epsilon annealing."""
 
-    gasd_epsilon_alpha_rate: float = 0.004
-    """Exponential growth rate: alpha(t) = epsilon_alpha * exp(rate * step).
-    Clamped to [epsilon_alpha, epsilon_alpha_max]."""
+    gasd_epsilon_warmup_steps: int = 50
+    """Hold epsilon at epsilon_alpha for this many initial steps."""
+
+    gasd_epsilon_ramp_end_steps: int = 800
+    """Step at which epsilon reaches epsilon_alpha_max (linear ramp from warmup to here)."""
 
     gasd_cg_iters: int = 10
     """Number of Conjugate Gradient iterations for solving (WW^T + eps*I) Delta = G."""
+
+    gasd_cg_rtol: float = 1e-5
+    """Relative residual tolerance for CG early stopping. Set to 0 to disable."""
+
+    gasd_cg_iters_min: Optional[int] = None
+    """Minimum CG iterations after decay. None = no decay (backward compatible). 0 = decay to pure Muon."""
+
+    gasd_cg_decay_style: str = "linear"
+    """CG iter decay style: 'linear' or 'cosine'. Schedule follows epsilon warmup/ramp window."""
 
     gasd_rms_scale: float = 1.0
     """Scale factor applied after RMS normalization of the CG output."""

@@ -73,10 +73,17 @@ class GASD(torch.optim.Optimizer):
         momentum: Momentum coefficient (beta) for EMA.
         weight_decay: Decoupled weight decay coefficient.
         use_nesterov: Whether to use Nesterov-style momentum.
-        epsilon_alpha: Initial/minimum coefficient for adaptive epsilon: eps = alpha(t) * ||W||_F^2 / min(n,m).
-        epsilon_alpha_max: Maximum coefficient cap for epsilon annealing (0 = no cap).
-        epsilon_alpha_rate: Exponential growth rate: alpha(t) = epsilon_alpha * exp(rate * step).
-        cg_iters: Number of Conjugate Gradient iterations (default 10).
+        epsilon_alpha: Minimum coefficient for adaptive epsilon: eps = alpha(t) * ||W||_F^2 / min(n,m).
+        epsilon_alpha_max: Maximum coefficient for epsilon annealing.
+        epsilon_warmup_steps: Hold epsilon_alpha constant for this many steps.
+        epsilon_ramp_end_steps: Step at which alpha reaches epsilon_alpha_max. Linear ramp between warmup and this.
+        cg_iters: Maximum number of Conjugate Gradient iterations (default 10).
+        cg_rtol: Relative residual tolerance for CG early stopping (default 1e-5).
+            CG terminates early when ||residual|| / ||rhs|| < cg_rtol. Set to 0 to disable.
+        cg_iters_min: Minimum CG iterations after decay. None = no decay. 0 = decay to pure Muon.
+            When set, CG iters decay from cg_iters to cg_iters_min following the epsilon
+            warmup/ramp schedule. Output is blended: w*GASD + (1-w)*Muon where w=cg_iters_t/cg_iters.
+        cg_decay_style: Decay style for CG iters: 'linear' or 'cosine'.
         rms_scale: Scale factor after RMS normalization of the CG output (default 1.0).
         split_qkv: Whether to split QKV parameters.
         is_qkv_fn: Function to check if a parameter is QKV.
@@ -98,9 +105,13 @@ class GASD(torch.optim.Optimizer):
         weight_decay: float = 0.01,
         use_nesterov: bool = True,
         epsilon_alpha: float = 1.0,
-        epsilon_alpha_max: float = 20.0,
-        epsilon_alpha_rate: float = 0.004,
+        epsilon_alpha_max: float = 1.0,
+        epsilon_warmup_steps: int = 50,
+        epsilon_ramp_end_steps: int = 800,
         cg_iters: int = 10,
+        cg_rtol: float = 1e-5,
+        cg_iters_min: Optional[int] = None,
+        cg_decay_style: str = "linear",
         rms_scale: float = 1.0,
         split_qkv: bool = False,
         is_qkv_fn: Optional[Callable[[torch.Tensor], bool]] = None,
@@ -117,6 +128,12 @@ class GASD(torch.optim.Optimizer):
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
         if cg_iters < 1:
             raise ValueError(f"cg_iters must be at least 1, got {cg_iters}")
+        if cg_rtol < 0:
+            raise ValueError(f"cg_rtol must be non-negative, got {cg_rtol}")
+        if cg_iters_min is not None and not (0 <= cg_iters_min <= cg_iters):
+            raise ValueError(
+                f"cg_iters_min must be in [0, cg_iters={cg_iters}], got {cg_iters_min}"
+            )
 
         defaults = dict(
             lr=lr,
@@ -128,8 +145,12 @@ class GASD(torch.optim.Optimizer):
         self.use_nesterov = use_nesterov
         self.epsilon_alpha = epsilon_alpha
         self.epsilon_alpha_max = epsilon_alpha_max
-        self.epsilon_alpha_rate = epsilon_alpha_rate
+        self.epsilon_warmup_steps = epsilon_warmup_steps
+        self.epsilon_ramp_end_steps = epsilon_ramp_end_steps
         self.cg_iters = cg_iters
+        self.cg_rtol = cg_rtol
+        self.cg_iters_min = cg_iters_min
+        self.cg_decay_style = cg_decay_style
         self.rms_scale = rms_scale
         self.split_qkv = split_qkv
         self.is_qkv_fn = is_qkv_fn
@@ -211,32 +232,68 @@ class GASD(torch.optim.Optimizer):
         torch.set_float32_matmul_precision(orig_prec)
         return result.to(orig_dtype)
 
+    def _get_cg_iters(self) -> int:
+        """Compute current CG iteration count based on decay schedule.
+
+        Reuses epsilon warmup/ramp window. Returns self.cg_iters when no decay.
+        """
+        if self.cg_iters_min is None or self.cg_iters_min >= self.cg_iters:
+            return self.cg_iters
+        step = self._step_count
+        if step <= self.epsilon_warmup_steps:
+            return self.cg_iters
+        if step >= self.epsilon_ramp_end_steps:
+            return self.cg_iters_min
+        t = (step - self.epsilon_warmup_steps) / (
+            self.epsilon_ramp_end_steps - self.epsilon_warmup_steps
+        )
+        if self.cg_decay_style == "cosine":
+            t = (1 - math.cos(math.pi * t)) / 2
+        cg_float = self.cg_iters * (1 - t) + self.cg_iters_min * t
+        return max(self.cg_iters_min, round(cg_float))
+
     def _apply_gasd(self, muon_update: torch.Tensor, W: torch.Tensor) -> torch.Tensor:
         """Solve (WW^T + eps*I) Delta = Phi via batch Conjugate Gradient.
 
         Avoids forming the [n, n] matrix WW^T explicitly. Each CG iteration
         only requires two matmuls: v = W^T @ P, then AP = W @ v + eps * P.
         W is the current weight (recomputed every step).
+
+        When CG iter decay is enabled, blends the RMS-normalized CG output with
+        the raw Muon output (Phi) using w = cg_iters_t / cg_iters. This smoothly
+        transitions from GASD (w=1, RMS-normed) to pure Muon (w=0, natural scale).
         """
+        cg_iters_t = self._get_cg_iters()
+
+        # Pure Muon: skip CG entirely, preserve Muon's natural scale (e.g. 0.2)
+        if cg_iters_t == 0:
+            return muon_update
+
         orig_dtype = muon_update.dtype
         Phi = muon_update.float()
         W_f32 = W.detach().float()
         n, m = W_f32.shape
 
-        # Adaptive epsilon: alpha(t) = clamp(alpha_min * exp(rate * t), alpha_min, alpha_max)
-        alpha_t = self.epsilon_alpha * math.exp(self.epsilon_alpha_rate * self._step_count)
-        if self.epsilon_alpha_max > 0:
-            alpha_t = min(alpha_t, self.epsilon_alpha_max)
-        fnorm_sq = W_f32.norm().square().clamp_min(1e-12)
-        eps = alpha_t * fnorm_sq / min(n, m)
+        # Three-stage epsilon: [0, warmup] = alpha_min, [warmup, ramp_end] = linear, [ramp_end, ∞] = alpha_max
+        step = self._step_count
+        if step <= self.epsilon_warmup_steps:
+            alpha_t = self.epsilon_alpha
+        elif step >= self.epsilon_ramp_end_steps:
+            alpha_t = self.epsilon_alpha_max
+        else:
+            t = (step - self.epsilon_warmup_steps) / (self.epsilon_ramp_end_steps - self.epsilon_warmup_steps)
+            alpha_t = self.epsilon_alpha + t * (self.epsilon_alpha_max - self.epsilon_alpha)
+        eps = alpha_t
 
         # Batch CG: solve (WW^T + eps*I) Delta = Phi
         Delta = torch.zeros_like(Phi)
         R = Phi.clone()
         P = R.clone()
         rr = (R * R).sum()
+        rr_init = rr
+        cg_tol_sq = self.cg_rtol ** 2 * rr_init
 
-        for _ in range(self.cg_iters):
+        for cg_step in range(cg_iters_t):
             # A @ P = W @ (W^T @ P) + eps * P
             AP = W_f32 @ (W_f32.t() @ P) + eps * P
 
@@ -247,13 +304,35 @@ class GASD(torch.optim.Optimizer):
             R = R - alpha_cg * AP
 
             rr_new = (R * R).sum()
+
+            # Early stopping: relative residual ||r||/||b|| < cg_rtol
+            if rr_new < cg_tol_sq:
+                rr = rr_new
+                break
+
             beta_cg = rr_new / rr.clamp_min(1e-30)
             P = R + beta_cg * P
             rr = rr_new
+        else:
+            # CG did not converge — log warning
+            rel_residual = (rr / rr_init.clamp_min(1e-30)).sqrt().item()
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                f"GASD CG not converged: {cg_iters_t} iters, "
+                f"rel_residual={rel_residual:.2e}, rtol={self.cg_rtol:.1e}, "
+                f"shape={tuple(W_f32.shape)}, eps={eps:.2e}, step={self._step_count}",
+            )
 
         # RMS normalization: Delta = Delta / RMS(Delta) * scale
         rms = (Delta.square().mean()).sqrt().clamp_min(1e-12)
         Delta = Delta / rms * self.rms_scale
+
+        # Blend GASD and Muon outputs for smooth scale transition
+        # w=1.0: full GASD (RMS-normed), w=0.0: pure Muon (natural scale)
+        if self.cg_iters_min is not None and cg_iters_t < self.cg_iters:
+            w = cg_iters_t / self.cg_iters
+            Delta = w * Delta + (1 - w) * Phi
 
         return Delta.to(orig_dtype)
 
@@ -311,6 +390,7 @@ class GASD(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
 
         for group in self.param_groups:
             momentum_beta = group['momentum']
@@ -446,8 +526,12 @@ def get_megatron_gasd_optimizer(
         use_nesterov=config.gasd_use_nesterov,
         epsilon_alpha=config.gasd_epsilon_alpha,
         epsilon_alpha_max=config.gasd_epsilon_alpha_max,
-        epsilon_alpha_rate=config.gasd_epsilon_alpha_rate,
+        epsilon_warmup_steps=config.gasd_epsilon_warmup_steps,
+        epsilon_ramp_end_steps=config.gasd_epsilon_ramp_end_steps,
         cg_iters=config.gasd_cg_iters,
+        cg_rtol=config.gasd_cg_rtol,
+        cg_iters_min=config.gasd_cg_iters_min,
+        cg_decay_style=config.gasd_cg_decay_style,
         rms_scale=config.gasd_rms_scale,
         num_ns_steps=config.gasd_num_ns_steps,
         scale_mode=config.gasd_scale_mode,
