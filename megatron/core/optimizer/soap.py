@@ -226,13 +226,23 @@ class SoapFloat16Optimizer(Float16OptimizerWithFloat16Params):
 
         step = self._extract_common_per_param_step(state_dict['optimizer'])
 
-        # --- SOAP-specific: pull preconditioner tensors out before sharding ---
+        # --- SOAP-specific: split precond tensors from Adam state ---
+        # NOTE: torch.optim.Optimizer.state_dict() returns shallow references to
+        # self.state[param], so pop() would mutate the live optimizer state and
+        # break the next optimizer.step(). Build fresh dicts instead.
         precond_states = {}
+        adam_state = {}
         for param_id, param_state in state_dict['optimizer']['state'].items():
-            precond_states[param_id] = {}
-            for key in _SOAP_PRECOND_KEYS:
-                if key in param_state:
-                    precond_states[param_id][key] = param_state.pop(key)
+            precond = {}
+            adam = {}
+            for k, v in param_state.items():
+                if k in _SOAP_PRECOND_KEYS:
+                    precond[k] = v
+                else:
+                    adam[k] = v
+            precond_states[param_id] = precond
+            adam_state[param_id] = adam
+        state_dict['optimizer']['state'] = adam_state
 
         # Shard the remaining Adam-compatible state (exp_avg, exp_avg_sq)
         optim_state_to_sharding_state(
@@ -282,13 +292,21 @@ class SoapFP32Optimizer(FP32Optimizer):
         )
         step = self._extract_common_per_param_step(state_dict)
 
-        # --- SOAP-specific: pull preconditioner tensors out before sharding ---
+        # --- SOAP-specific: split precond tensors from Adam state ---
+        # Avoid mutating live optimizer state (see SoapFloat16Optimizer).
         precond_states = {}
+        adam_state = {}
         for param_id, param_state in state_dict['state'].items():
-            precond_states[param_id] = {}
-            for key in _SOAP_PRECOND_KEYS:
-                if key in param_state:
-                    precond_states[param_id][key] = param_state.pop(key)
+            precond = {}
+            adam = {}
+            for k, v in param_state.items():
+                if k in _SOAP_PRECOND_KEYS:
+                    precond[k] = v
+                else:
+                    adam[k] = v
+            precond_states[param_id] = precond
+            adam_state[param_id] = adam
+        state_dict['state'] = adam_state
 
         # Shard the remaining Adam-compatible state (exp_avg, exp_avg_sq)
         optim_state_to_sharding_state(
