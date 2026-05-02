@@ -16,6 +16,7 @@ from typing import Dict, List, Optional
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import (
     ShardedStateDict,
     ShardedTensor as MappingShardedTensor,
@@ -52,6 +53,37 @@ logger = logging.getLogger(__name__)
 _SOAP_PRECOND_KEYS = ('L', 'R', 'Q_L', 'Q_R')
 
 
+def _resolve_factory_to_sharded_tensor(factory):
+    """Return the inner ShardedTensor representing the weight itself.
+
+    Megatron registers some 2D weights as ShardedTensorFactory (TE-fused
+    layers, certain GQA/MoE paths).  The factory's .build() returns a
+    sub-state-dict that contains the real ShardedTensor(s).  We pick the
+    one whose local data matches the factory's original parameter so that
+    prepend_axis_num / global_offset / axis_fragmentations describe the
+    same layer-level positioning as the weight.
+
+    Returns None if no matching ShardedTensor can be found.
+    """
+    try:
+        built = factory.build()
+    except Exception:
+        return None
+    factory_data = factory.data
+    candidates = [v for v in nested_values(built) if isinstance(v, MappingShardedTensor)]
+    if not candidates:
+        return None
+    # Prefer the ShardedTensor that wraps the same underlying storage as the factory.
+    for st in candidates:
+        if st.data is factory_data:
+            return st
+    # Fall back to the one with matching shape.
+    for st in candidates:
+        if tuple(st.data.shape) == tuple(factory_data.shape):
+            return st
+    return candidates[0]
+
+
 def _make_precond_sharded_tensor(precond_key, precond_data, model_sharded_param):
     """Build a ShardedTensor for a SOAP preconditioner matrix.
 
@@ -77,20 +109,39 @@ def _make_precond_sharded_tensor(precond_key, precond_data, model_sharded_param)
         precond_data: the local preconditioner tensor [dim, dim]
         model_sharded_param: ShardedTensor or ShardedTensorFactory from model
     """
-    if isinstance(model_sharded_param, ShardedTensorFactory):
-        # ShardedTensorFactory occurs for vocab-parallel embeddings, but those
-        # have is_embedding_or_output_parameter=True and go to nonlinear_params
-        # (Adam), not SOAP.  If we ever reach here, fall back to plain tensor.
-        return precond_data
-
     tp_group = parallel_state.get_tensor_model_parallel_group()
     dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
     tp_rank = torch.distributed.get_rank(tp_group)
     tp_size = torch.distributed.get_world_size(tp_group)
     dp_rank = torch.distributed.get_rank(dp_cp_group)
+    allow_mismatch = precond_key in ('L', 'R')
+
+    if isinstance(model_sharded_param, ShardedTensorFactory):
+        resolved = _resolve_factory_to_sharded_tensor(model_sharded_param)
+        if resolved is not None:
+            model_sharded_param = resolved
+        else:
+            # No inner ShardedTensor recoverable.  Rely on the factory's key
+            # being unique per-layer (PP stages naturally carry distinct keys)
+            # and shard along TP so each TP rank's preconditioner occupies a
+            # distinct slice of the virtual global tensor.
+            key = f'optimizer.state.{precond_key}.{model_sharded_param.key}'
+            if tp_size == 1:
+                return MappingShardedTensor.from_rank_offsets(
+                    key,
+                    precond_data,
+                    replica_id=(0, 0, dp_rank),
+                    allow_shape_mismatch=allow_mismatch,
+                )
+            return MappingShardedTensor.from_rank_offsets(
+                key,
+                precond_data,
+                (0, tp_rank, tp_size),
+                replica_id=(0, 0, dp_rank),
+                allow_shape_mismatch=allow_mismatch,
+            )
 
     key = f'optimizer.state.{precond_key}.{model_sharded_param.key}'
-    allow_mismatch = precond_key in ('L', 'R')
     prepend_axis_num = model_sharded_param.prepend_axis_num
 
     # Build rank_offsets for prepended axes (e.g. layer index under PP).
