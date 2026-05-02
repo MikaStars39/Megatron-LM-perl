@@ -60,6 +60,10 @@ def _make_precond_sharded_tensor(precond_key, precond_data, model_sharded_param)
     [dim*tp, dim] global tensor.  This ensures every chunk of the global tensor
     is covered (required by validate_sharding_integrity).
 
+    When the model parameter uses prepend_axis_num (e.g. for layer indices in PP),
+    those prepended axes are replicated so that each layer's preconditioner gets
+    a unique position in the global checkpoint.
+
     Each TP rank's preconditioner is computed from local gradients and has
     unique values, so none can be treated as replicated.
 
@@ -87,21 +91,39 @@ def _make_precond_sharded_tensor(precond_key, precond_data, model_sharded_param)
 
     key = f'optimizer.state.{precond_key}.{model_sharded_param.key}'
     allow_mismatch = precond_key in ('L', 'R')
+    prepend_axis_num = model_sharded_param.prepend_axis_num
+
+    # Build rank_offsets for prepended axes (e.g. layer index under PP).
+    # These axes have local_axis_shape=1 in from_rank_offsets, so
+    # (axis, offset, fragm) maps to global_shape[axis]=fragm,
+    # global_offset[axis]=offset.
+    prepend_offsets = []
+    for axis in range(prepend_axis_num):
+        offset = model_sharded_param.global_offset[axis]
+        fragm = model_sharded_param.axis_fragmentations[axis]
+        prepend_offsets.append((axis, offset, fragm))
+
+    # TP axis index is shifted by prepend_axis_num.
+    tp_axis = prepend_axis_num  # axis 0 of the actual [dim, dim] data
 
     if tp_size == 1:
         return MappingShardedTensor.from_rank_offsets(
             key,
             precond_data,
+            *prepend_offsets,
+            prepend_axis_num=prepend_axis_num,
             replica_id=(0, 0, dp_rank),
             allow_shape_mismatch=allow_mismatch,
         )
 
-    # TP > 1: stack each rank's [dim, dim] along axis 0 into a
-    # [dim*tp, dim] global tensor.  Each rank owns one [dim, dim] slice.
+    # TP > 1: stack each rank's [dim, dim] along axis 0 (shifted by prepend)
+    # into a [dim*tp, dim] global tensor.  Each rank owns one [dim, dim] slice.
     return MappingShardedTensor.from_rank_offsets(
         key,
         precond_data,
-        (0, tp_rank, tp_size),
+        *prepend_offsets,
+        (tp_axis, tp_rank, tp_size),
+        prepend_axis_num=prepend_axis_num,
         replica_id=(0, 0, dp_rank),
         allow_shape_mismatch=allow_mismatch,
     )
