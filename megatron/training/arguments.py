@@ -1266,6 +1266,11 @@ def validate_args(args, defaults={}):
         assert not args.use_megatron_fsdp, "SOAP does not support Megatron-FSDP."
         assert args.ckpt_format in ["torch", "torch_dist"], "SOAP supports torch and torch_dist checkpoint format."
 
+    # Lion optimizer check
+    if args.optimizer == 'lion':
+        assert not args.optimizer_cpu_offload, "Lion does not support optimizer CPU offload."
+        assert args.ckpt_format in ["torch", "torch_dist"], "Lion optimizer supports torch and torch_dist checkpoint format."
+
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (
@@ -2245,6 +2250,12 @@ def _add_regularization_args(parser):
                        dest='soap_split_qkv',
                        help='Disable QKV splitting for SOAP optimizer')
 
+    # Lion (EvoLved Sign Momentum)
+    group.add_argument('--lion-beta1', type=float, default=0.9,
+                       help='Beta1 for Lion optimizer (sign interpolation).')
+    group.add_argument('--lion-beta2', type=float, default=0.99,
+                       help='Beta2 for Lion optimizer (momentum EMA).')
+
     return parser
 
 
@@ -2495,7 +2506,7 @@ def _add_training_args(parser):
     group.add_argument('--qk-clip-threshold', type=float, default=100,
                        help='The balancing threshold for qk-clip.')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'roo', 'roo_normal', 'muon_projected', 'gasd', 'rmsprop', 'soap'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'roo', 'roo_normal', 'muon_projected', 'gasd', 'rmsprop', 'soap', 'lion'],
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')

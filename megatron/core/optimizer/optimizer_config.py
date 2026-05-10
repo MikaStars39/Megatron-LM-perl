@@ -143,6 +143,13 @@ class OptimizerConfig:
     rmsprop_centered: bool = False
     """If true, compute the centered RMSprop (gradient normalized by its variance)."""
 
+    # Lion
+    lion_beta1: float = 0.9
+    """Beta1 coefficient for Lion sign update interpolation."""
+
+    lion_beta2: float = 0.99
+    """Beta2 coefficient for Lion momentum EMA update."""
+
     # Muon
     muon_momentum: float = 0.95
     """The momentum used by the internal SGD."""

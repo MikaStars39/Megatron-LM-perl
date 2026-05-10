@@ -33,6 +33,13 @@ except ImportError:
 
         USING_PYTORCH_OPTIMIZER = True
 
+try:
+    from emerging_optimizers.scalar_optimizers import Lion
+
+    HAVE_LION = True
+except ImportError:
+    HAVE_LION = False
+
 from megatron.core import parallel_state
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -398,6 +405,24 @@ def _get_megatron_optimizer_based_on_param_groups(
                                 opt.state[p]['momentum_buffer'] = torch.zeros_like(p.data)
                             if config is not None and config.rmsprop_centered:
                                 opt.state[p]['grad_avg'] = torch.zeros_like(p.data)
+
+        elif config.optimizer == 'lion':
+            assert HAVE_LION, (
+                "Emerging Optimizers package is required for Lion. Install it first."
+            )
+            optimizer = Lion(
+                param_groups,
+                lr=config.lr,
+                betas=(config.lion_beta1, config.lion_beta2),
+                weight_decay=config.weight_decay,
+                weight_decay_method="decoupled" if config.decoupled_weight_decay else "l2",
+            )
+
+            def init_state_fn(opt, config=None):
+                for group in opt.param_groups:
+                    for p in group['params']:
+                        if len(opt.state[p]) == 0:
+                            opt.state[p]['exp_avg'] = torch.zeros_like(p.data)
 
         else:
             raise Exception('{} optimizer is not supported.'.format(config.optimizer))
