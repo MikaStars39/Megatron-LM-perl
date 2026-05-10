@@ -338,6 +338,32 @@ class OptimizerConfig:
     soap_split_qkv: bool = True
     """Whether to split QKV parameters for SOAP optimizer."""
 
+    # Shampoo (true Shampoo: update = L^(-1/4) G R^(-1/4)).
+    shampoo_momentum: float = 0.9
+    """Heavy-ball momentum coefficient for the gradient EMA in Shampoo."""
+
+    shampoo_beta: float = 0.95
+    """EMA beta for L,R Kronecker factors in Shampoo."""
+
+    shampoo_eps: float = 1e-12
+    """Eigenvalue floor (clamp_min) before the inverse 4th-root of L,R."""
+
+    shampoo_precondition_frequency: int = 20
+    """How often (in steps) to recompute inverse 4th-root preconditioners."""
+
+    shampoo_max_update_rms: float = 0.0
+    """Clip the update RMS to this value in Shampoo (0 = no clipping)."""
+
+    shampoo_correct_bias: bool = False
+    """Adam-style bias correction on the momentum (off = classical Anil Shampoo)."""
+
+    shampoo_correct_factor_bias: bool = True
+    """EMA bias correction on L,R before forming inverse roots
+    (distributed-Shampoo standard; on by default to avoid first-step over-update)."""
+
+    shampoo_split_qkv: bool = False
+    """[v2 placeholder] Split fused QKV columns before forming L. Currently raises."""
+
     #######################
     # Distributed optimizer
     #######################

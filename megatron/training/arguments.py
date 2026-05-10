@@ -1266,6 +1266,15 @@ def validate_args(args, defaults={}):
         assert not args.use_megatron_fsdp, "SOAP does not support Megatron-FSDP."
         assert args.ckpt_format in ["torch", "torch_dist"], "SOAP supports torch and torch_dist checkpoint format."
 
+    # Shampoo optimizer check
+    if args.optimizer == 'shampoo':
+        assert not args.use_distributed_optimizer, "Shampoo does not support distributed optimizer."
+        assert not args.use_torch_fsdp2, "Shampoo does not support Torch-FSDP2."
+        assert not args.use_megatron_fsdp, "Shampoo does not support Megatron-FSDP."
+        assert args.ckpt_format in ["torch", "torch_dist"], "Shampoo supports torch and torch_dist checkpoint format."
+        assert not args.fp16, "Shampoo does not support fp16 (use bf16 or fp32)."
+        assert not args.optimizer_cpu_offload, "Shampoo does not support CPU offload."
+
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (
@@ -2245,6 +2254,34 @@ def _add_regularization_args(parser):
                        dest='soap_split_qkv',
                        help='Disable QKV splitting for SOAP optimizer')
 
+    # Shampoo (true Shampoo: update = L^(-1/4) G R^(-1/4))
+    group.add_argument('--shampoo-momentum', type=float, default=0.9,
+                       help='Heavy-ball momentum coefficient for the gradient EMA in Shampoo')
+    group.add_argument('--shampoo-beta', type=float, default=0.95,
+                       help='EMA beta for L,R Kronecker factors in Shampoo')
+    group.add_argument('--shampoo-eps', type=float, default=1e-12,
+                       help='Eigenvalue floor before inverse 4th root in Shampoo')
+    group.add_argument('--shampoo-precondition-frequency', type=int, default=20,
+                       help='Steps between inverse-root refreshes in Shampoo')
+    group.add_argument('--shampoo-max-update-rms', type=float, default=0.0,
+                       help='Clip the update RMS to this value in Shampoo (0 = no clipping)')
+    group.add_argument('--shampoo-correct-bias', action='store_true', default=False,
+                       help='Adam-style bias correction on momentum in Shampoo (off by default; '
+                            'classical Anil. Note: --soap-correct-bias is a separate flag for SOAP)')
+    group.add_argument('--shampoo-no-correct-bias', action='store_false',
+                       dest='shampoo_correct_bias',
+                       help='Disable Adam-style momentum bias correction in Shampoo (default)')
+    group.add_argument('--shampoo-correct-factor-bias', action='store_true', default=True,
+                       help='EMA bias correction on L,R before inverse roots in Shampoo '
+                            '(distributed-Shampoo standard; on by default)')
+    group.add_argument('--shampoo-no-correct-factor-bias', action='store_false',
+                       dest='shampoo_correct_factor_bias',
+                       help='Disable L/R bias correction (ablation only; expect ~4x larger '
+                            'first-step update with default shampoo_beta=0.95)')
+    group.add_argument('--shampoo-split-qkv', action='store_true', default=False,
+                       help='[v2 TODO] Split fused QKV columns before forming L in Shampoo. '
+                            'Currently unimplemented; will raise NotImplementedError if set.')
+
     return parser
 
 
@@ -2495,7 +2532,7 @@ def _add_training_args(parser):
     group.add_argument('--qk-clip-threshold', type=float, default=100,
                        help='The balancing threshold for qk-clip.')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'roo', 'roo_normal', 'muon_projected', 'gasd', 'rmsprop', 'soap'],
+                       choices=['adam', 'sgd', 'muon', 'dist_muon', 'roo', 'roo_normal', 'muon_projected', 'gasd', 'rmsprop', 'soap', 'shampoo'],
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
